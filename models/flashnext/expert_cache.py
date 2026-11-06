@@ -262,6 +262,14 @@ def set_route_trace(callback=None) -> None:
     _ROUTE_TRACE[0] = callback
 
 
+_PREFILL_RING = [None]
+
+
+def set_prefill_ring(ring) -> None:
+    """Install (or clear, with None) the opt-in prefill read ring."""
+    _PREFILL_RING[0] = ring
+
+
 def set_prefill_progress(callback) -> None:
     """Observe completed streamed MoE layers during one prompt prefill."""
     global _PREFILL_PROGRESS
@@ -1755,7 +1763,17 @@ class StreamingSwitchGLU(nn.Module):
             local = mx.array(
                 [order[e] for e in routed], dtype=mx.uint32
             ).reshape(indices.shape)
-        weights = self._read_weights(projections, wanted)
+        weights = None
+        ring = _PREFILL_RING[0]
+        if ring is not None and flat_input.shape[0] > 8:
+            # Opt-in prefill ring: same experts, same order, read into the pool.
+            # None means this layer falls back to the existing read path.
+            weights = ring.stage(
+                self.gate_proj.cache.store,
+                self.gate_proj.cache.prefix.rsplit(".", 1)[0], wanted,
+            )
+        if weights is None:
+            weights = self._read_weights(projections, wanted)
 
         issue_began = time.perf_counter() if _PROFILE else 0.0
         with hostwindow.window("moe_issue_host"):

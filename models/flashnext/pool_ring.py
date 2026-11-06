@@ -66,11 +66,12 @@ def plan_ring(
     budget_bytes=None,
     max_pool_fraction: float = 0.5,
     keep_slots: int = MIN_DECODE_SLOTS,
+    halves: int = 2,
 ) -> int:
     """Largest experts-per-half that fits every limit, at most the request.
 
-    Limits: the ring (two halves) may not exceed ``max_pool_fraction`` of the
-    pool, must leave ``keep_slots`` for decode, and may not exceed
+    Limits: the ring (``halves`` halves) may not exceed ``max_pool_fraction``
+    of the pool, must leave ``keep_slots`` for decode, and may not exceed
     ``budget_bytes`` when given. Returns 0 when not even one expert fits.
     """
     limit_slots = min(
@@ -78,7 +79,7 @@ def plan_ring(
     )
     if budget_bytes is not None:
         limit_slots = min(limit_slots, int(budget_bytes) // int(stride))
-    half_slots = limit_slots // 2
+    half_slots = limit_slots // max(1, int(halves))
     if half_slots <= 0:
         return 0
     fit = (half_slots * int(stride)) // int(expert_bytes)
@@ -180,7 +181,7 @@ class _Writing:
 
 
 class PoolRing:
-    """Two part-major halves inside a leased range of the expert pool."""
+    """One or two part-major halves inside a leased range of the expert pool."""
 
     def __init__(
         self,
@@ -190,12 +191,16 @@ class PoolRing:
         header: int = POOL_HEADER,
         lease=lease_range,
         give_back=return_range,
+        halves: int = 2,
     ):
         self.parts = tuple(PartSpec(name, int(size)) for name, size in parts)
         if not self.parts or any(part.row_bytes <= 0 for part in self.parts):
             raise ValueError("a ring needs parts with positive row sizes")
         if half_experts < 1:
             raise ValueError("half_experts must be at least 1")
+        if halves not in (1, 2):
+            raise ValueError("halves must be 1 or 2")
+        self.halves = int(halves)
         self.pool = pool
         self.half_experts = int(half_experts)
         self.expert_bytes = sum(part.row_bytes for part in self.parts)
@@ -203,11 +208,11 @@ class PoolRing:
         self.slots_per_half = slots_per_half(
             self.half_experts, self.expert_bytes, self.stride
         )
-        self.count = 2 * self.slots_per_half
+        self.count = self.halves * self.slots_per_half
         self._give_back = give_back
         self._header = int(header)
         self._cond = threading.Condition()
-        self._halves = (_Half(), _Half())
+        self._halves = tuple(_Half() for _ in range(self.halves))
         self._closed = False
         self._released = False
         self._stats = {"fills": 0, "computes": 0, "refused_writes": 0, "evicted": 0}
@@ -223,7 +228,7 @@ class PoolRing:
 
     def _lay_out(self) -> None:
         self._offsets = []
-        for half in range(2):
+        for half in range(self.halves):
             base = (
                 self._header
                 + (self.first_slot + half * self.slots_per_half) * self.stride

@@ -444,6 +444,51 @@ except Exception:                                            # pragma: no cover
 
 
 @unittest.skipIf(_expert_pool is None, "needs MLX and NumPy")
+class SingleHalfTests(unittest.TestCase):
+    """Stage 1 has no overlap, so one half is enough."""
+
+    def test_plan_divides_the_ring_budget_by_the_half_count(self):
+        self.assertEqual(plan_ring(1953, 3_072_000, 3_072_000, 512, halves=2), 488)
+        self.assertEqual(plan_ring(1953, 3_072_000, 3_072_000, 512, halves=1), 512)
+        self.assertEqual(plan_ring(1953, 3_072_000, 3_072_000, 2000, halves=1), 976)
+        self.assertEqual(plan_ring(32, 12, 12, 100, halves=1), 16)
+
+    def test_single_half_ring_leases_half_the_slots(self):
+        pool, ring = make_ring(half_experts=4, halves=1)
+        self.assertEqual(ring.halves, 1)
+        self.assertEqual(ring.ring_bytes, 4 * STRIDE)
+        self.assertEqual(len(pool._free), 40 - 4)
+        first = ring.begin_fill()
+        self.assertIsNotNone(first)
+        self.assertIsNone(ring.begin_fill())          # no second half exists
+        first.release()
+        self.assertIsNotNone(ring.begin_fill())
+        ring.close(timeout=WAIT)
+        self.assertEqual(len(pool._free), 40)
+
+    def test_single_half_walks_the_state_machine(self):
+        _pool, ring = make_ring(half_experts=4, halves=1)
+        lease = ring.begin_fill()
+        with lease.writing():
+            lease.part_view("w")[:8] = b"abcdefgh"
+        lease.mark_filled(timeout=WAIT)
+        lease.begin_compute()
+        self.assertEqual(lease.state, COMPUTING)
+        lease.end_compute()
+        lease.release()
+        self.assertEqual(lease.state, "stale")        # the handle is dead...
+        self.assertEqual(ring.stats()["states"], [FREE])  # ...the half is free
+        again = ring.begin_fill()
+        self.assertIsNotNone(again)
+        again.release()
+        ring.close(timeout=WAIT)
+
+    def test_invalid_half_counts_are_refused(self):
+        for halves in (0, 3):
+            with self.assertRaises((RingError, ValueError)):
+                make_ring(halves=halves)
+
+
 class RealPoolTests(unittest.TestCase):
     ROWS = [("gate_w", 819_200), ("gate_s", 102_400), ("gate_b", 102_400),
             ("up_w", 819_200), ("up_s", 102_400), ("up_b", 102_400),

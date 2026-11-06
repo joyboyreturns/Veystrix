@@ -20,7 +20,7 @@ PREFILL_CLEAR_CACHE = os.environ.get("FLASHNEXT_PREFILL_CLEAR_CACHE", "1") != "0
 # (2026-09-22), so it is not exact and was removed.
 
 
-def prefill_target(
+def _prefill_target(
     language,
     ids,
     cache,
@@ -104,3 +104,34 @@ def prefill_language(language, ids, cache, sampler=None):
         language, ids, cache, sampler=sampler
     )
     return None, token
+
+
+def prefill_target(
+    language,
+    ids,
+    cache,
+    want_logits: bool = False,
+    want_hidden: bool = False,
+    sampler=None,
+):
+    """Push one target prompt through the model and seed its next token.
+
+    With ``FLASHNEXT_PREFILL_RING_EXPERTS`` unset (the default) this is exactly
+    ``_prefill_target``. When set, the prefill holds the in-pool read ring for
+    its duration; see ``prefill_ring``.
+    """
+    from models.flashnext import prefill_ring
+
+    if not prefill_ring.enabled():
+        return _prefill_target(
+            language, ids, cache, want_logits, want_hidden, sampler,
+        )
+    with prefill_ring.session(language, int(ids.shape[1])) as ring:
+        result = _prefill_target(
+            language, ids, cache, want_logits, want_hidden, sampler,
+        )
+        if ring is not None:
+            # Nothing the caller keeps may still read ring memory lazily.
+            mx.eval([item for item in result if item is not None])
+            prefill_ring.fence()
+        return result
