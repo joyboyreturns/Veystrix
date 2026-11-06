@@ -75,7 +75,7 @@ Today `local` is first-seen order, so the sorted row order of
 `_gather_sort` follows first appearance. With slot or expert-id indices the
 runs are ordered by id instead. The bytes per expert are identical, but the
 order of runs could in principle change the tile layout. Gate P2: on random
-weights with the real shapes (hidden 2048, intermediate 800, Q4/G32, 512
+weights with the real shapes (hidden 2560, intermediate 640, Q4/G32, 512
 experts, widths up to 10), `mx.array_equal` of `gather_qmm` outputs between
 compact first-seen arrays, id-ordered strided pool views, and a shuffled slot
 order, at 1K, 2K and 4K rows. The E1 experiment (digest changed at 1,007
@@ -188,3 +188,93 @@ the threshold conditions are not met.
 4. Wire it behind the flag, then full-model gates with permission: identical
    digest, paired reversed arms at 1K and 2K, MLX peak and free memory,
    exit-137 watch, and decode rate for 128 tokens after a long prefill.
+
+## 9. Measured results, 2026-11-06 (synthetic, this M4 Air, no checkpoint)
+
+Environment: `.venv` from `pyproject.toml` (MLX 0.32.2, Python 3.12). MLX
+reports `max_recommended_working_set_size` 12,713,115,648 B and
+`max_buffer_length` 9,534,832,640 B, so H1 in section 5 is confirmed: the
+working-set limit is 12.7 GB. Correction to earlier text: the layer shape is
+hidden 2560, intermediate 640 (the slab layout's 640x320 weight rows), not
+2048 and 800. Scripts are in the session scratchpad and are not committed.
+
+### Experiment A: operands (512 experts per ring half, random Q4/G32 weights)
+
+| Operand layout | Extra memory during `gather_qmm` | Bit-identical to today's compact arrays | Time vs compact |
+|---|---|---|---|
+| Part-major views inside the pool (9 contiguous slices) | 0 (view build adds 0 bytes; op peak equals compact) | yes, at 64, 256, 1,024, 2,048 and 4,096 tokens | same (235.7 vs 230.8 ms at 2,048; 395.1 vs 397.4 ms at 4,096) |
+| Record-layout strided views (design v1, section 2.1) | +1.6 GB at 256 and 1,024 tokens, +1.9 GB at 2,048, +2.3 GB at 4,096 | yes | +40 to 90% (177.5 vs 95.3 ms at 256; 332.5 vs 230.8 ms at 2,048; 537.3 vs 397.4 ms at 4,096) |
+
+- At 64 tokens (640 rows) the strided view does not copy. From about 256
+  tokens (2,560 rows) MLX materializes the whole strided expert span, so the
+  record-layout view is **rejected**: it is the second 1.6 GB buffer the
+  design set out to avoid, and it is slower.
+- Part-major placement is invariant to order: id order, a random permutation
+  and first-seen rank all gave identical bits. This closes the exactness gate
+  of section 2.4 for this kernel and these shapes. Sorted row order is not a
+  numerical hazard here.
+- An unrequested observation: in a smaller diagnostic (256-expert half, a
+  768-slot whole-pool view, gate projection only) the whole-pool strided view
+  returned wrong bits at 1,024 and 2,048 rows. I did not investigate. It is a
+  further reason to avoid strided views.
+- The routed-expert chain alone (gate, up, down on 20,480 rows) took about 236
+  ms per layer at 2,048 tokens, or about 11 s over 48 layers: 0.85 TFLOPS
+  against a GPU peak of about 4 TFLOPS (peak is an external figure). That is
+  a hard ceiling near 180 tok/s for routed-expert compute alone at this kernel
+  efficiency.
+
+**Revised architecture:** lease a contiguous slot range and re-lay it out
+part-major (nine contiguous arrays of 512 rows, the checkpoint tensors'
+layout), not as 3,072,000-byte records. A leased slot is not a decode record
+while leased, so the layout is free. Each part is then one contiguous file
+range read into one contiguous destination, and `local` is the expert id.
+
+### Experiment B: SSD reads and compute (scratch file of random bytes, 8 layers, 8 workers, F_NOCACHE, reversed rounds)
+
+| Tokens, GPU scale | Dense read ms/layer (1.57 GB) | Sparse read ms/layer (334 experts, 1.03 GB) | Serial, dense | Overlap, dense | Overlap speedup |
+|---|---|---|---|---|---|
+| 1,024 x1 | 432 | 300 | 505 | 431 | 1.17x |
+| 1,024 x2 | 421 | 297 | 578 | 446 | 1.30x |
+| 2,048 x1 | 420 | 298 | 538 | 435 | 1.24x |
+| 2,048 x2 | 419 | 298 | 711 | 529 | 1.35x |
+
+- Dense reads ran at 3.64 to 3.76 GB/s, sparse (2-row tasks) at 3.42 to 3.45
+  GB/s. The recorded production prefill averaged 1.0 GB/s and 1.9 GB/s while
+  waiting, on a machine with a 256 GB SSD. This machine's SSD is faster, so
+  absolute times do not transfer.
+- Reads during overlap: 412 to 414 ms/layer in three cases against 420 to 432
+  alone (no slowdown), and 490 against 419 in the heaviest case (+17%).
+- Overlap came within 0 to 13% of the ideal `max(read, GPU)` in the
+  read-bound cases and about 26% over it in the heaviest case.
+- GPU interference is **not resolved**. The GPU-only arm ran 1.5 to 2 times
+  slower per layer than the GPU portion inside the serial arm (for example 213
+  vs 118 ms at 2,048 tokens), reproducibly in both round orders. That looks
+  like a GPU clock or power-state effect, the same family as the keep-warm
+  finding, so the printed "GPU slowdown" figures (-51% to +4%) are not valid
+  evidence either way. The end-to-end serial-over-overlap ratios are the
+  reliable measure, because both arms do identical work.
+- Memory: MLX peak 3.3 to 3.5 GB, max RSS 4.36 GB (both ring halves plus
+  activations), zero page-outs, swap-outs and compressions, swap use unchanged
+  (1,814 to 1,806 MB), free memory 8.8 GB afterwards.
+
+### What the numbers say about a net gain
+
+Dense reading costs 41% more time per layer than the sparse pattern at 334
+experts (420 vs 298 ms). Against today's sparse-serial path (derived: serial
+minus dense read plus sparse read) dense-overlap came out at 0.87x, 1.02x,
+0.96x and 1.12x in the four synthetic cases, i.e. no gain when the stand-in
+GPU time per layer is short. Overlap with dense reads beats sparse-serial
+whenever GPU time per layer exceeds about 120 ms (and reads stay hidden when it
+exceeds 420 ms), provided contention inflates the GPU by less than the margin.
+The recorded 1,007-token profile had about 310 ms of GPU time per layer
+(14.9 s over 48 layers, old clock) and 626 ms at 2,031 tokens by scaling, which
+is where dense-overlap should win (derived 1.4x to 1.6x, a projection, not a
+measurement). The synthetic GPU stand-in covers routed experts only, with no
+attention, so it understates real per-layer GPU time.
+
+Below roughly 1.4K tokens the dense read (about 420 ms per layer here) exceeds
+the GPU time, so overlap there is read-bound and sparse prefetch needs the
+predictor. A separate and cheaper lever appeared: sparse reads with
+`F_NOCACHE` into resident pool pages reached 3.4 GB/s here against the log's
+1.9 GB/s (the machines differ, so this is a hypothesis for the reference
+machine).
