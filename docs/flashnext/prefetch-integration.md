@@ -278,3 +278,70 @@ predictor. A separate and cheaper lever appeared: sparse reads with
 `F_NOCACHE` into resident pool pages reached 3.4 GB/s here against the log's
 1.9 GB/s (the machines differ, so this is a hypothesis for the reference
 machine).
+
+## 10. Measured results, round two (synthetic, this M4 Air, no checkpoint)
+
+Scripts are in the session scratchpad and are not committed. Same hardware,
+`.venv` with MLX 0.32.2, a 28 GB scratch file of random bytes (deleted after),
+8 workers, `F_NOCACHE` where stated.
+
+### Read paths (334 experts, 6 layers per arm, 3 reversed rounds)
+
+| Arm | ms/layer (median) | vs today | Compressions (all rounds) |
+|---|---|---|---|
+| today: buffered pread + copy into fresh arrays | 330 | 1.00x | 94,997 |
+| buffered preadv into fresh arrays | 347 | 0.95x | 198,532 |
+| F_NOCACHE pread + copy into fresh arrays | 333 | 0.99x | 5,652 |
+| F_NOCACHE preadv into fresh arrays | 293 | 1.13x | 2,862 |
+| F_NOCACHE preadv into resident ring, first-seen order | 196 | 1.68x | 47,108 |
+| same, sorted by expert id | 324 | 1.02x | 9,408 |
+| same, sorted, 16 workers | 261 | 1.27x | 0 |
+
+- The gain comes from the resident destination, not from `F_NOCACHE` alone.
+  The best arm varied between 1.10 s and 1.59 s across rounds, so read 1.68x as
+  about 1.2x to 1.8x.
+- Sorting by expert id is slower (324 against 196 ms). I cannot explain it; keep
+  the first-seen order the current path already uses.
+- Memory compression is explained by the buffered arms: they caused 95,000 to
+  199,000 compressions (about 1.5 to 3.2 GB of pages) against 0 to 9,000 for
+  the direct arms, because the page cache grows and macOS compresses other
+  anonymous memory to make room. The ring arm's 47,000 is unexplained (it may
+  be idle ring pages being compressed between arms) and must be re-checked on
+  the integrated path. Swap-outs were 0 everywhere.
+
+### Duty-matched GPU contention (median GPU time per layer, ms)
+
+| Case | back to back | after an idle gap | during overlapped reads |
+|---|---|---|---|
+| 1,024 tokens, 334 experts, 1x GPU | 124 | 66 | 71-77 |
+| 1,024, 334, 2x | 254 | 138 | 144-253 |
+| 2,048, 400, 1x | 211 | 118 | 114-119 |
+| 2,048, 400, 2x | 437 | 274 | 370-466 |
+| 1,024, 512, 1x | 140 | 85 | 81-85 |
+
+The same GPU work runs 1.6 to 1.9 times slower back to back than after an idle
+gap, with no SSD traffic, so most of the earlier slowdown is a sustained-load
+effect, not SSD contention. During overlapped reads the GPU was within 0 to 11%
+of the idle-gap time when its duty was low, and approached the back-to-back time
+as duty approached 100%.
+
+### Sparse prefetch with overlap against today's sparse-serial path (speed, higher is faster)
+
+| Predictor (recall/precision) | 1K, 334, 1x | 1K, 334, 2x | 2K, 400, 1x | 2K, 400, 2x | 1K, 512, 1x |
+|---|---|---|---|---|---|
+| 1.0 / 1.0 | 1.65x | 1.38x | 1.58x | 1.37x | 1.43x |
+| 0.90 / 0.80 | 1.05x | 1.19x | 1.16x | 1.35x | 1.29x |
+| 0.75 / 0.70 | 1.12x | 1.16x | 1.19x | 1.25x | 1.26x |
+| 0.50 / 0.50 | 0.95x | 1.03x | 1.18x | 1.20x | 1.43x |
+
+The overlap arms read in sorted order, which the read-path table shows is the
+slow order, so these are conservative. Predictor recall on a real prefill is
+unmeasured; the only recorded figure is 72% at top-10 for one decode token.
+
+### Consequence for stage 1
+
+Stage 1 reads exactly the routed experts, first-seen order, with `F_NOCACHE`
+`preadv` into a resident ring half and runs `gather_qmm` on part-major views:
+no prediction, no concurrent SSD and GPU work. It needs one half, not two,
+because a layer's reads cannot start before the previous layer's compute has
+finished.
