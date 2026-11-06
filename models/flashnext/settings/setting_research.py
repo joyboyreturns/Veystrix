@@ -89,6 +89,7 @@ SETTINGS = (
     research("compile-gdn", "FLASHNEXT_COMPILE_GDN", "1", parser=choice(("0", "1"), "compile-gdn"), unset="0"),
     research("expert-pool-gb", "FLASHNEXT_EXPERT_POOL_GB", "6", "startup", float, unset="0"),
     research("expert-pool-lock", "FLASHNEXT_EXPERT_POOL_LOCK"),
+    research("prefill-prefetch-gb", "FLASHNEXT_PREFILL_PREFETCH_GB", "0", "startup", float, unset="0"),
     research("compile-hc", "FLASHNEXT_COMPILE_HC", "1", parser=choice(("0", "1"), "compile-hc"), unset="0"),
     research("compile-norm", "FLASHNEXT_COMPILE_NORM", "1", parser=choice(("0", "1"), "compile-norm"), unset="0"),
     research("stream-embed", "FLASHNEXT_STREAM_EMBED", "1", "startup", choice(("0", "1"), "stream-embed"), unset="0"),
