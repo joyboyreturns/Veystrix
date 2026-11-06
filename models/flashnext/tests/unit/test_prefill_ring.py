@@ -74,6 +74,8 @@ def build_checkpoint(directory):
 class RingCase(unittest.TestCase):
     """Builds the store, pool and two streamed layers once per test."""
 
+    pool_gb = "0.15"
+
     @classmethod
     def setUpClass(cls):
         cls.directory = tempfile.TemporaryDirectory()
@@ -84,7 +86,8 @@ class RingCase(unittest.TestCase):
         cls.directory.cleanup()
 
     def setUp(self):
-        patcher = mock.patch.dict(os.environ, ENV)
+        patcher = mock.patch.dict(
+            os.environ, {**ENV, "FLASHNEXT_EXPERT_POOL_GB": self.pool_gb})
         patcher.start()
         self.addCleanup(patcher.stop)
         self.store = SafeTensorStore(self.directory.name)
@@ -190,6 +193,37 @@ class TensorCorrectnessTests(RingCase):
         self.assertRestored()
 
 
+class HighOffsetTests(RingCase):
+    """A 4.6 GB pool puts the ring above 4.29 GB, where a bf16 element index
+    passes 2**31. Only the touched ring pages become resident."""
+
+    pool_gb = "4.6"
+
+    def test_views_beyond_the_32_bit_element_range_hold_the_checkpoint_rows(self):
+        wanted = [9, 3, 11, 0, 6]
+        with prefill_ring.session(self.language, 1024) as ring:
+            self.assertIsNotNone(ring, prefill_ring.LAST_REASON[0])
+            top = (expert_pool.HEADER + ring.ring.first_slot * self.pool.stride)
+            self.assertGreater(top // 2, 2**31 - 1)   # old bf16 index overflowed
+            weights = ring.stage(self.store, prefix_of(1), wanted)
+            self.assertIsNotNone(weights, ring.stats()["last_error"])
+            for projection, parts in zip(PROJECTIONS, weights):
+                for kind, array in zip(prefill_ring.KINDS, parts):
+                    name = f"{prefix_of(1)}.{projection}.{kind}"
+                    expected = self.store.rows_np(name, wanted)
+                    got = np.array(array.view(mx.uint16) if kind != "weight" else array)
+                    self.assertEqual(got.tobytes(), expected.tobytes(), name)
+
+    def test_output_is_bitwise_equal_with_the_ring_high_in_a_big_pool(self):
+        x, indices = self.inputs()
+        reference = self.run_layers(x, indices)
+        with prefill_ring.session(self.language, 1024) as ring:
+            produced = self.run_layers(x, indices)
+            self.assertEqual(ring.stats()["staged_layers"], len(LAYERS))
+        for got, want in zip(produced, reference):
+            self.assertTrue(bool(mx.array_equal(got, want)))
+
+
 class FallbackTests(RingCase):
     def reference_and_ring(self, x, indices, ring):
         reference = self.run_layers(x, indices)
@@ -286,20 +320,61 @@ class AcquireTests(RingCase):
             self.assertEqual(self.reason(), "expert pool is off")
 
     def test_refuses_when_the_working_set_does_not_fit(self):
-        pool_bytes = len(self.pool._mm)
-        limit = pool_bytes + mx.get_active_memory() + 400_000_000
-        with mock.patch.object(prefill_ring, "metal_working_set_limit", return_value=limit):
-            # 0.1 GB transient + 0.5 GB margin does not fit in 0.4 GB of room.
-            self.assertIsNone(prefill_ring.acquire(self.language, 1024))
-            self.assertTrue(self.reason().startswith("working set: pool "), self.reason())
-            self.assertIn("exceeds limit", self.reason())
-        with mock.patch.object(
-            prefill_ring, "metal_working_set_limit", return_value=limit + 400_000_000
-        ):
-            state = prefill_ring.acquire(self.language, 1024)
-            self.assertIsNotNone(state)
-            prefill_ring.release(state)
+        # Active memory is patched: reading the real value twice races with
+        # MLX freeing earlier tests' arrays asynchronously. It already
+        # contains the pool, which must count once.
+        active = len(self.pool._mm) + 100_000_000
+        limit = active + 400_000_000
+        with mock.patch.object(mx, "get_active_memory", return_value=active):
+            with mock.patch.object(
+                prefill_ring, "metal_working_set_limit", return_value=limit
+            ):
+                # 0.1 GB transient + 0.5 GB margin does not fit in 0.4 GB.
+                self.assertIsNone(prefill_ring.acquire(self.language, 1024))
+                self.assertTrue(
+                    self.reason().startswith("working set: MLX active"), self.reason())
+                self.assertIn("exceeds limit", self.reason())
+            with mock.patch.object(
+                prefill_ring, "metal_working_set_limit",
+                return_value=limit + 400_000_000,
+            ):
+                state = prefill_ring.acquire(self.language, 1024)
+                self.assertIsNotNone(state)
+                prefill_ring.release(state)
         self.assertRestored()
+
+    def test_the_pool_is_counted_once(self):
+        pool_bytes = len(self.pool._mm)
+        self.assertEqual(prefill_ring.working_set_bytes(pool_bytes + 5, pool_bytes),
+                         pool_bytes + 5)
+        self.assertEqual(prefill_ring.working_set_bytes(7, pool_bytes), 7 + pool_bytes)
+        # The fact the formula rests on, checked against MLX itself: every live
+        # wrapped pool is inside active memory. A lower bound, not a before and
+        # after difference, because MLX frees earlier tests' arrays
+        # asynchronously and would make a difference unreliable.
+        stride = self.pool.stride
+        second = expert_pool.ExpertPool(
+            self.store, expert_pool.HEADER + 20 * stride, 32)
+        try:
+            live = len(self.pool._mm) + len(second._mm)
+            self.assertGreaterEqual(mx.get_active_memory(), live)
+        finally:
+            second.close()
+
+    def test_a_pool_sized_to_fit_is_accepted_once_counted_once(self):
+        # Room for the pool once plus transient (0.1 GB) and margin (0.5 GB),
+        # but not for the pool counted twice.
+        pool_bytes = len(self.pool._mm)
+        active = pool_bytes + 100_000_000
+        limit = active + 100_000_000 + 500_000_000 + 50_000_000
+        self.assertLess(limit - active, pool_bytes + 100_000_000 + 500_000_000)
+        with mock.patch.object(mx, "get_active_memory", return_value=active):
+            with mock.patch.object(
+                prefill_ring, "metal_working_set_limit", return_value=limit
+            ):
+                state = prefill_ring.acquire(self.language, 1024)
+                self.assertIsNotNone(state, self.reason())
+                prefill_ring.release(state)
 
     def test_refuses_when_the_limit_is_unknown(self):
         with mock.patch.object(prefill_ring, "metal_working_set_limit", return_value=None):

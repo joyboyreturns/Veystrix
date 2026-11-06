@@ -26,9 +26,9 @@ Ownership and safety
     None and the caller uses the existing read path for that layer.
 
 Memory
-    The ring adds nothing beyond the pool. ``acquire`` refuses unless the pool,
-    MLX's active memory and a transient estimate fit under Metal's recommended
-    working set with a margin, and ``stage`` re-checks the live active memory
+    The ring adds nothing beyond the pool. ``acquire`` refuses unless MLX's
+    active memory (which already includes the wrapped pool) plus a transient
+    estimate fit under Metal's recommended working set with a margin, and ``stage`` re-checks the live active memory
     every layer and disables the ring for the rest of the prefill if it does
     not.
 
@@ -55,6 +55,7 @@ FLAG_TRANSIENT_GB = "FLASHNEXT_PREFILL_RING_TRANSIENT_GB"
 PROJECTIONS = ("gate_proj", "up_proj", "down_proj")
 KINDS = ("weight", "scales", "biases")
 CLOSE_TIMEOUT = 30.0
+INT32_MAX = 2**31 - 1
 
 PartPlan = namedtuple("PartPlan", "name dtype tail row_bytes")
 
@@ -124,6 +125,19 @@ def fence() -> None:
     mx.eval(mx.zeros((1,)) + 1)
 
 
+def working_set_bytes(active: int, pool_bytes: int) -> int:
+    """Bytes MLX has resident, counting the wrapped expert pool exactly once.
+
+    The pool is wrapped zero-copy as an MLX array (``ExpertPool.buffer_mx``),
+    and MLX counts it in ``get_active_memory`` and ``get_peak_memory``:
+    creating a 6 GB pool raised active memory by exactly 6.000 GB. Adding the
+    pool again double counts it. If active memory ever reads lower than the
+    pool, something is off, so the pool is added to stay on the safe side.
+    """
+    active, pool_bytes = int(active), int(pool_bytes)
+    return active if active >= pool_bytes else active + pool_bytes
+
+
 def metal_working_set_limit():
     """Metal's recommended working set in bytes, or None when unknown."""
     import mlx.core as mx
@@ -173,7 +187,6 @@ class PrefillRing:
         self._synchronize = synchronize
         self._pool_view = pool._view
         self._buf32 = None
-        self._buf16 = None
         self.pending = None
         self.disabled = None
         self.last_error = None
@@ -244,9 +257,8 @@ class PrefillRing:
     def _over_limit(self) -> bool:
         if self._limit is None or self._active_memory is None:
             return False
-        return (
-            self._active_memory() + self._pool_bytes + self._margin > self._limit
-        )
+        used = working_set_bytes(self._active_memory(), self._pool_bytes)
+        return used + self._margin > self._limit
 
     def _queue_reads(self, lease, store, switch_prefix, wanted):
         rows = list(enumerate(wanted))                  # (ring row, expert)
@@ -264,24 +276,34 @@ class PrefillRing:
         return futures
 
     def _views(self, lease, count: int):
+        """Nine zero-copy contiguous slices of the pool's Metal buffer.
+
+        MLX slice indices are 32-bit. The pool is wrapped as uint32, whose
+        element index stays below 2**31 for pools up to 8 GiB, so every part
+        is sliced as uint32 and bf16 parts are reinterpreted afterwards. A
+        bf16 element index would pass 2**31 once the ring sits above 4 GiB in
+        a 6 GB pool, which an earlier version hit.
+        """
         import mlx.core as mx
 
         if self._buf32 is None:
             self._buf32 = self.pool.buffer_mx
-            self._buf16 = self._buf32.view(mx.bfloat16)
         arrays = {}
         for plan in self.plans:
             offset, _ = lease.row_range(plan.name, 0, 1)
             elements = count
             for dimension in plan.tail:
                 elements *= dimension
-            if plan.dtype == "U32":
-                source, first = self._buf32, offset // 4
-            else:
-                source, first = self._buf16, offset // 2
-            arrays[plan.name] = source[first:first + elements].reshape(
-                (count, *plan.tail)
-            )
+            nbytes = elements * (4 if plan.dtype == "U32" else 2)
+            if offset % 4 or nbytes % 4:
+                raise RingUnavailable(f"{plan.name} is not 4-byte aligned in the ring")
+            first, words = offset // 4, nbytes // 4
+            if first + words > INT32_MAX:
+                raise RingUnavailable("ring lies beyond the 32-bit slice range")
+            part = self._buf32[first:first + words]
+            if plan.dtype != "U32":
+                part = part.view(mx.bfloat16)
+            arrays[plan.name] = part.reshape((count, *plan.tail))
         return [
             tuple(arrays[f"{projection}.{kind}"] for kind in KINDS)
             for projection in PROJECTIONS
@@ -376,14 +398,13 @@ def acquire(language, tokens: int):
         LAST_REASON[0] = "working-set limit unknown"
         return None
     active = mx.get_active_memory()
-    if not fits_working_set(
-        pool_bytes, active + transient_bytes(), limit, margin_bytes()
-    ):
+    used = working_set_bytes(active, pool_bytes)
+    if not fits_working_set(0, used + transient_bytes(), limit, margin_bytes()):
         LAST_REASON[0] = (
-            f"working set: pool {pool_bytes / 1e9:.2f} GB + active "
-            f"{active / 1e9:.2f} GB + transient {transient_bytes() / 1e9:.2f} GB "
-            f"+ margin {margin_bytes() / 1e9:.2f} GB exceeds limit "
-            f"{limit / 1e9:.2f} GB"
+            f"working set: MLX active {active / 1e9:.2f} GB (includes the "
+            f"{pool_bytes / 1e9:.2f} GB pool) + transient "
+            f"{transient_bytes() / 1e9:.2f} GB + margin "
+            f"{margin_bytes() / 1e9:.2f} GB exceeds limit {limit / 1e9:.2f} GB"
         )
         return None
     try:
