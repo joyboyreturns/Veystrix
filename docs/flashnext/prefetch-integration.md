@@ -191,6 +191,12 @@ the threshold conditions are not met.
 
 ## 9. Measured results, 2026-11-06 (synthetic, this M4 Air, no checkpoint)
 
+> **Power-state caveat (recorded 2026-11-07).** The machine may have been on
+> battery in Low Power Mode when these numbers were taken; the power state was
+> not logged. Treat absolute times, GB/s and the ratios between arms as
+> unconfirmed until they are repeated plugged in with Low Power Mode off. The
+> results are kept as measured. Nothing below is a production speedup claim.
+
 Environment: `.venv` from `pyproject.toml` (MLX 0.32.2, Python 3.12). MLX
 reports `max_recommended_working_set_size` 12,713,115,648 B and
 `max_buffer_length` 9,534,832,640 B, so H1 in section 5 is confirmed: the
@@ -281,6 +287,12 @@ machine).
 
 ## 10. Measured results, round two (synthetic, this M4 Air, no checkpoint)
 
+> **Power-state caveat (recorded 2026-11-07).** The machine may have been on
+> battery in Low Power Mode when these numbers were taken; the power state was
+> not logged. Treat absolute times, GB/s and the ratios between arms as
+> unconfirmed until they are repeated plugged in with Low Power Mode off. The
+> results are kept as measured. Nothing below is a production speedup claim.
+
 Scripts are in the session scratchpad and are not committed. Same hardware,
 `.venv` with MLX 0.32.2, a 28 GB scratch file of random bytes (deleted after),
 8 workers, `F_NOCACHE` where stated.
@@ -345,3 +357,119 @@ Stage 1 reads exactly the routed experts, first-seen order, with `F_NOCACHE`
 no prediction, no concurrent SSD and GPU work. It needs one half, not two,
 because a layer's reads cannot start before the previous layer's compute has
 finished.
+
+## 11. Stage 1 as implemented (opt-in, off by default)
+
+### 11.1 What it does
+
+`FLASHNEXT_PREFILL_RING_EXPERTS=N` (N > 0, with `FLASHNEXT_EXPERT_POOL_GB` set)
+makes `prefill_target` hold one ring half of N experts, leased from the top of
+the existing pool, for the duration of one prefill (`prefill_ring.session`).
+In `StreamingSwitchGLU._one_pass`, for layers with more than 8 rows, the
+routed experts (first-seen order, exactly the router's choice) are read with
+`F_NOCACHE` `preadv` into the half and handed to `gather_qmm` as nine
+zero-copy part-major views. No prediction, no read concurrent with GPU work.
+With the flag unset, `prefill_target` calls the unchanged function and
+`_PREFILL_RING` stays `None`, so the existing path is byte-for-byte what ran
+before.
+
+Settings (research, startup): `FLASHNEXT_PREFILL_RING_EXPERTS` (0),
+`..._MIN_TOKENS` (512), `..._MARGIN_GB` (0.5), `..._TRANSIENT_GB` (2.0).
+
+### 11.2 Guards and fallbacks (each makes that layer use the existing path)
+
+| Condition | Behaviour |
+|---|---|
+| Layer routes more experts than the half holds | fall back, counted |
+| Read error or short read | half released, error recorded, fall back |
+| Half busy | fall back |
+| Live MLX active memory + pool + margin over the Metal limit | ring disabled for the rest of the prefill |
+| Prompt shorter than `MIN_TOKENS`, pool off, layouts differ, dtype unsupported, limit unknown | ring not acquired; `LAST_REASON` says why |
+| Working set at acquire: pool + active + transient + margin over limit | not acquired; reason prints the four numbers |
+| Exception or `KeyboardInterrupt` in the prefill or a read | wait for the GPU (`fence`), release the half, return every slot, clear the hook |
+
+The half is retired at the next layer's `stage` (the router sync before it
+proves the previous layer's GPU work finished) or at session end, after the
+final evals; `prefill_target` also evaluates anything it returns and fences
+before the lease is given back.
+
+### 11.3 A deadlock found while testing: do not call `mx.synchronize`
+
+`mx.synchronize()` keeps the GIL while it waits. MLX's completion handler can
+need the GIL to free a numpy-backed operand (the existing read path wraps
+numpy buffers with `from_dlpack`), so a synchronize that actually waits can
+deadlock. A test hung there; a stack sample showed the main thread in
+`waitUntilCompleted` and the completion queue blocked. The ring uses
+`prefill_ring.fence()` instead, a one-element `mx.eval`, which releases the
+GIL and cannot finish before earlier work on the same stream. Anything else
+added around this path should do the same.
+
+### 11.4 Offline test results (2026-11-07, no GPU benchmark)
+
+New: `test_prefill_ring.py` (32 tests), 4 `halves=1` tests in
+`test_pool_ring.py`. They use a synthetic checkpoint with real row sizes
+(hidden 2560, intermediate 640, Q4/G32), the real `SafeTensorStore`, real
+`StreamingSwitchGLU` layers and a real `ExpertPool`. They check: ring output
+bitwise equal to the existing path across two layers; staged views equal the
+checkpoint rows in first-seen order with the right dtypes; zero-copy
+(active memory grows under 1 MB for 8 experts, a copy would be 6 MB or more
+per projection); nothing outside the leased range is written; decode-sized
+calls never touch the ring; every fallback and refusal in 11.2; slot
+restoration on normal exit, exception, cancellation and a second session;
+the `prefill_target` hook wiring.
+
+Full offline suites: flashnext 525 tests, one failing assertion in my own new
+test (a released lease handle reports `stale`, the half is `free`), fixed and
+re-run with `test_pool_ring`, `test_prefill_ring` and `test_settings_registry`
+(67 OK); macqwen 427 OK. The complete flashnext suite is re-run before commit.
+
+### 11.5 The memory compression question: still open
+
+Hypothesis from section 10: buffered page-cache reads cause the compressions
+(95K and 199K per arm for the buffered arms, 0 to 9K for `F_NOCACHE`), but the
+resident-ring arm showed 47K that nothing explained, and it had no idle
+control.
+
+An integrated-path run (`exp_e_integrated.py`: real layers, a 12.6 GB random
+checkpoint, existing path vs ring vs an idle control) was started on
+2026-11-07 and stopped by itself after the first arm. It is **not** a result:
+
+* The existing path's first arm recorded 499K compressions, 417K
+  decompressions and 797K page-ins in 10.2 s with MLX peak 7.0 GB, a heavy
+  memory-pressure signature on this machine, but at the start free memory was
+  7.6 GB and the power state is unknown (Low Power Mode possible).
+* The ring then refused to acquire, correctly, on the working-set check
+  (`pool + active + transient + margin` over the 12.7 GB limit). The refusal
+  message did not print its numbers then; it does now.
+* No ring or idle arm completed, so nothing here shows whether the ring
+  reduces, matches or increases compression.
+
+Do not enable the ring by default until the run is repeated plugged in, Low
+Power Mode off, and the ring arm and the idle control have both completed.
+Per-arm compression rates against the idle control are the figure that
+matters.
+
+### 11.6 Still to validate on the real Qwen3.8 checkpoint
+
+All of this needs the real checkpoint on the plugged-in, Low Power Mode off
+machine, after you approve a benchmark window.
+
+1. **Working-set fit.** The existing path's MLX peak was 7.0 GB in the
+   synthetic run. With the 6 GB pool resident that is above the 12.7 GB limit
+   before any ring. Measure the real peak at 1K and 2K tokens, with and
+   without the ring, and confirm `_over_limit` trips before Metal pressure.
+   The acquire check uses `transient` (2.0 GB default) as an estimate, not a
+   measurement.
+2. **Exactness.** Compare the digest of ring-on and ring-off prefill outputs
+   (logits or hidden state) token for token on real prompts. Synthetic
+   bitwise equality is necessary, not sufficient.
+3. **Speed.** Paired, order-reversed arms at 1K and 2K tokens. Report only
+   measured numbers.
+4. **Compression and free memory** with an idle control (11.5), and the
+   exit-137 watch during a 2K-token run.
+5. **Decode after prefill.** The pool's cached experts below the ring stay
+   valid; check decode rate and hit rate after a ring prefill match the
+   existing path.
+6. **Ring size.** The default request is the flag value; a layer that routes
+   more experts than the half falls back. Check the real distribution
+   (about 334 per layer at 1K tokens) against `FLASHNEXT_PREFILL_RING_EXPERTS`.
