@@ -423,7 +423,11 @@ test (a released lease handle reports `stale`, the half is `free`), fixed and
 re-run with `test_pool_ring`, `test_prefill_ring` and `test_settings_registry`
 (67 OK); macqwen 427 OK. The complete flashnext suite is re-run before commit.
 
-### 11.5 The memory compression question: still open
+### 11.5 The memory compression question (first attempt; superseded by section 12)
+
+*Update 2026-11-07: section 12 has the measured answer. The paragraphs below
+are the state before those runs and contain one wrong inference, corrected in
+12.7.*
 
 Hypothesis from section 10: buffered page-cache reads cause the compressions
 (95K and 199K per arm for the buffered arms, 0 to 9K for `F_NOCACHE`), but the
@@ -454,12 +458,18 @@ matters.
 All of this needs the real checkpoint on the plugged-in, Low Power Mode off
 machine, after you approve a benchmark window.
 
-1. **Working-set fit.** The existing path's MLX peak was 7.0 GB in the
-   synthetic run. With the 6 GB pool resident that is above the 12.7 GB limit
-   before any ring. Measure the real peak at 1K and 2K tokens, with and
-   without the ring, and confirm `_over_limit` trips before Metal pressure.
-   The acquire check uses `transient` (2.0 GB default) as an estimate, not a
-   measurement.
+1. **Working-set fit, the main risk.** MLX's peak already includes the
+   wrapped 6 GB pool (12.7). The synthetic MoE-only runs peaked at 7.2 to 8.2
+   GB without the ring and 6.2 to 6.8 GB with it, but the real model also holds
+   the dense core (about 3.4 GB) and transients (about 1.7 GB, section 5). The
+   section 5 estimate stands: about 12.1 GB with the pool warm and no ring, so
+   about 0.6 GB under the 12.713 GB limit, and about 11.1 GB with the ring
+   (the 1 GB of per-layer read buffers disappears). Measure the real peak,
+   including attention and KV cache, at 1K, 2K and 4K tokens, with and without
+   the ring, and confirm `_over_limit` trips before Metal pressure. The acquire
+   check uses `transient` (2.0 GB default) as an estimate: with the dense core
+   and pool resident (about 9.4 GB) plus 2.0 plus the 0.5 GB margin it passes
+   at about 11.9 GB, which is close to the limit.
 2. **Exactness.** Compare the digest of ring-on and ring-off prefill outputs
    (logits or hidden state) token for token on real prompts. Synthetic
    bitwise equality is necessary, not sufficient.
@@ -473,3 +483,141 @@ machine, after you approve a benchmark window.
 6. **Ring size.** The default request is the flag value; a layer that routes
    more experts than the half falls back. Check the real distribution
    (about 334 per layer at 1K tokens) against `FLASHNEXT_PREFILL_RING_EXPERTS`.
+
+## 12. Stage 1 benchmark, battery mode (2026-11-07)
+
+**Preliminary.** MacBook Air M4, 16 GB, on battery with Low Power Mode off
+(battery 92% to 84% over the whole session), no thermal warning recorded,
+`CPU_Speed_Limit` 100 throughout. These are not the final plugged-in
+benchmarks. Synthetic random Q4/G32 tensors with the real expert row sizes
+(3,072,000 B per expert), a real store, real `StreamingSwitchGLU` layers, a
+real `ExpertPool` and the real `prefill_ring` session. **MoE layers only:** no
+attention, router, KV cache or n-gram work, and random routing. No model
+weights. Raw data, logs and the harness: `docs/flashnext/results/stage1-ring-battery-2026-11-07/`.
+
+### 12.1 Two bugs that only a real-size pool could show
+
+Both were in the first Stage 1 commits (6ec6cc0, c5d3ca9). The unit tests
+missed them because their pool is 0.15 GB. Both are fixed in the commit that
+follows them and are covered by new tests that fail on the old code (checked in
+a separate worktree at c5d3ca9: all five regression tests fail there; the slice
+tests also fail, with the original `Slice indices must be 32-bit integers`
+error, when only the old slicing is put back under the new guard).
+
+1. **The pool was counted twice in the memory guard.** MLX counts the wrapped
+   pool in `get_active_memory` and `get_peak_memory`: creating a 6 GB pool
+   raised active memory by exactly 6.000 GB. The acquire and per-layer guards
+   added `pool_bytes` on top, so with a 6 GB pool the ring refused every time
+   (`6 + 6 + 2 + 0.5` against 12.71 GB). Now `working_set_bytes` counts it once.
+2. **bf16 slices overflowed MLX's 32-bit slice index.** A ring sitting above
+   4.29 GB in a 6 GB pool needs bf16 element indices above 2^31, and MLX
+   raised `Slice indices must be 32-bit integers`. Every layer fell back to the
+   old path. Parts are now sliced as uint32 (index below 2^31 up to 8 GiB) and
+   reinterpreted as bf16; a part that cannot be 4-byte aligned or lies beyond
+   the range falls back.
+
+Also, one unit test was flaky (about 1 failure in 15 runs): it derived a limit
+from one active-memory reading while MLX freed earlier tests' arrays
+asynchronously. Both guard tests now patch the reading.
+
+### 12.2 Design and safety
+
+Each size ran in a fresh process with a blocked design: three runs of one arm,
+three of the other, then an idle control, order reversed every round, 3 rounds,
+8 layers per arm, fresh random experts per arm so the page cache cannot favour
+either arm. A bit-identity round per size ran both arms on identical routes
+and compared a hash of every layer's output. The watchdog stops on battery
+below 25%, memory pressure level 2 or higher, any new swap-out, a CPU speed
+limit below 90, Low Power Mode on, or an MLX peak within 0.2 GB of the 12.713
+GB Metal limit. Result: the final runs never tripped it. The earlier
+alternating run did trip it (memory pressure level 2 at the start of its 2K
+phase, after 24 arms in one process); nothing swapped.
+
+### 12.3 Results (steady state = runs 2 and 3 of each block; ON means ring on)
+
+| | 1K (334 experts) | 2K (400) | 4K (460) |
+|---|---|---|---|
+| Bit-identical to the original path | yes, 8 layers | yes, 8 layers | yes, 8 layers |
+| Wall speed-up, steady state (median, range, 95% t half-width, n=3) | 1.100 (1.090-1.123, ±0.042) | 1.099 (1.099-1.124, ±0.036) | 1.074 (1.035-1.082, ±0.062) |
+| Wall speed-up, all arms | 1.078 (1.074-1.086) | 1.095 (1.055-1.100) | 1.063 (1.000-1.083) |
+| ON faster in rounds | 3 of 3 | 3 of 3 | 3 of 3 steady, 2 of 3 all arms |
+| Wall per 8-layer arm, OFF to ON | 3.22 s to 2.90 s | 4.23 s to 3.86 s | 5.31 s to 4.99 s |
+| Expert read per layer, OFF to ON | 328 ms to 293 ms | 399 ms to 370 ms | 464 ms to 427 ms |
+| SSD throughput, OFF to ON | 3.12 to 3.52 GB/s | 3.08 to 3.33 GB/s | 3.05 to 3.32 GB/s |
+| GPU gather_qmm per layer, OFF to ON | 72.8 ms to 70.2 ms | 126.1 ms to 111.8 ms | 200.2 ms to 193.8 ms |
+
+The read gain is 8 to 11%. The GPU time is also a few percent lower with the
+ring, but the 95% interval on the GPU ratio at 2K is ±0.22, so that part is not
+established.
+
+### 12.4 Compression and memory
+
+| | 1K | 2K | 4K |
+|---|---|---|---|
+| Compressions per second, OFF steady / ON steady | 6,223 / 220 | 13,911 / 285 | 5,460 / 323 |
+| Compressions per second, OFF all arms / ON all arms | 29,361 / 3,107 | 28,952 / 2,793 | 26,263 / 2,673 |
+| Idle control, compressions per second | 0 | 0 | 0 |
+| MLX peak incl. the 6 GB pool, OFF / ON | 7.22 / 6.19 GB | 7.61 / 6.38 GB | 8.18 / 6.76 GB |
+| Working memory above the pool, OFF / ON | 1.2 / 0.2 GB | 1.6 / 0.4 GB | 2.2 / 0.8 GB |
+| Lowest free+inactive memory after an arm, OFF / ON | 5.9 / 3.0 GB | 5.7 / 2.9 GB | 5.8 / 2.9 GB |
+| Max pressure level, swap-outs | 1, 0 | 1, 0 | 1, 0 |
+
+* The idle control shows no background compression, so the compressions
+  belong to the arms.
+* Compression is mostly a transition effect. The first OFF run after an ON
+  block caused 312K to 408K compressions (415K to 622K at the very start); the
+  first ON run after an OFF block caused 33K to 59K; an ON run after an idle
+  gap or another ON run caused none. This is why the alternating design gave
+  an order effect (below).
+* The ring holds more memory resident: free+inactive memory after an ON arm
+  was about 2.9 GB against 5.7 to 5.9 GB after an OFF arm, because the ring's
+  pool pages stay resident as anonymous memory while OFF leaves reclaimable
+  page cache. Pressure stayed at level 1 and nothing swapped, but that is the
+  number to watch on the real model, where attention, KV cache and the
+  non-expert weights also need memory.
+* In these MoE-only runs the 12.713 GB Metal limit was never approached: the
+  closest was OFF at 4K, 4.5 GB below it. The real model has about 5 GB more
+  resident (dense core and transients), so this is not the real headroom; see
+  12.7 and 11.6.
+
+### 12.5 What the earlier numbers did and did not show
+
+* The 2-round smoke run read 1.55x on a 6.3 GB file. That is inflated: the
+  small file stayed in the page cache. Do not quote it.
+* The alternating 1K run (6 rounds) gave a median of 1.13x with a range of
+  0.95 to 1.26. By round the ratio was about 1.0 when the OFF arm ran first
+  and 1.2 when the ON arm ran first, because ON leaves less free memory and
+  the following OFF arm pays for compression. The blocked design is the fairer
+  comparison for a prefill, which runs layers back to back.
+* Experiment D (section 10) measured the resident ring reading 1.2 to 1.8x
+  faster than today's path. The integrated path measures 1.08 to 1.11x. The
+  two are not reconciled; D timed reads alone with a pre-touched ring.
+
+### 12.6 How far to trust it
+
+* Three rounds per size, so the intervals are wide (±0.04 to ±0.11) and a
+  ratio of 1.00 to 1.10 at 4K cannot be told apart from a small gain.
+* MoE layers only. A real prefill also spends time in attention, the router
+  sync and n-gram work. For scale, the recorded 1,007-token profile spent 25.6
+  s of 49.3 s in `io_wait`; a read gain of 8 to 11% on that share would be
+  about 2 to 3 s, roughly 5% end to end. That is a hypothesis, not a
+  measurement.
+* Random routing, and the expert counts for 2K (400) and 4K (460) are
+  estimates; only 334 at 1K is recorded.
+* Battery power. The earlier synthetic numbers and these may all move when
+  repeated plugged in. The GPU probe stayed near 6 ms with isolated spikes to
+  16 to 18 ms in single arms, so there was no sustained throttle.
+* The page cache and compressor state carry over between arms and set the
+  transition effects; real prefill has its own history.
+
+### 12.7 Corrections to earlier text
+
+* Section 11.5 and an earlier note said the synthetic path's 7.0 GB MLX peak
+  "plus the 6 GB pool" was already over the 12.7 GB limit. That was wrong for
+  those synthetic runs: MLX's peak already includes the pool, so 7.0 GB meant
+  about 1 GB of working memory above it.
+* Section 5 is **not** affected. Its real-model estimate (about 12.1 GB with
+  the pool warm) adds the pool once to a recorded 1,007-token peak of 6.145 GB
+  that had no pool in it, so the real-model headroom is only about 0.6 GB
+  without the ring. The synthetic headroom of 4.5 GB or more in 12.4 is for
+  MoE layers alone and must not be read as the real figure.

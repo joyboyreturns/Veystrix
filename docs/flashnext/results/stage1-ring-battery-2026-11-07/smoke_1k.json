@@ -1,0 +1,353 @@
+{
+ "script": "bench_ring.py",
+ "note": "battery-mode preliminary, MoE layers only, synthetic",
+ "start": {
+  "battery": {
+   "percent": 90,
+   "discharging": true,
+   "source": "battery"
+  },
+  "low_power": false,
+  "pressure": 1,
+  "speed_limit": 100,
+  "swap_used_mb": 834.5,
+  "free_gb": 9.66,
+  "thermal_text": "Note: No thermal warning level has been recorded | Note: No performance warning level has been recorded | Note: No CPU power status has been recorded"
+ },
+ "args": {
+  "sizes": "1k",
+  "rounds": 2,
+  "file_layers": 4,
+  "arm_layers": 4,
+  "dir": "<scratch>/scratch_bench",
+  "out": "<scratch>/bench_smoke.json",
+  "keep_dir": false
+ },
+ "sizes": {
+  "1k": {
+   "tokens": 1024,
+   "unique_experts": 334,
+   "rounds": [
+    {
+     "round": 0,
+     "order": [
+      "off",
+      "on",
+      "idle"
+     ],
+     "off": {
+      "arm": "off",
+      "probe_ms": 6.16,
+      "wall_s": 1.7548,
+      "read_s": 1.4023,
+      "gpu_s": 0.3491,
+      "other_s": 0.0035,
+      "bytes": 4104192000,
+      "read_gb_s": 2.927,
+      "read_ms_per_layer": 350.6,
+      "gpu_ms_per_layer": 87.3,
+      "staged": 0,
+      "fallbacks": 0,
+      "vm": {
+       "Pageins": 137931,
+       "Pageouts": 9,
+       "Swapins": 0,
+       "Swapouts": 0,
+       "Compressions": 256450,
+       "Decompressions": 104528
+      },
+      "compressor_pages_before": 138853,
+      "compressor_pages_after": 180714,
+      "mlx_peak_mb": 7220.5,
+      "mlx_active_mb_after": 6010.1,
+      "mlx_peak_gb_incl_pool": 7.22,
+      "free_gb_after": 6.88,
+      "battery_before": 90,
+      "battery_after": 90,
+      "speed_limit": 100,
+      "pressure": 1,
+      "swap_used_mb": 834.5
+     },
+     "on": {
+      "arm": "on",
+      "probe_ms": 5.96,
+      "ring_stats": {
+       "staged_layers": 4,
+       "fallback_capacity": 0,
+       "fallback_busy": 0,
+       "fallback_error": 0,
+       "fallback_memory": 0,
+       "disabled": null
+      },
+      "wall_s": 1.1518,
+      "read_s": 0.7591,
+      "gpu_s": 0.3892,
+      "other_s": 0.0035,
+      "bytes": 4104192000,
+      "read_gb_s": 5.406,
+      "read_ms_per_layer": 189.8,
+      "gpu_ms_per_layer": 97.3,
+      "staged": 4,
+      "fallbacks": 0,
+      "vm": {
+       "Pageins": 291,
+       "Pageouts": 0,
+       "Swapins": 0,
+       "Swapouts": 0,
+       "Compressions": 19705,
+       "Decompressions": 161640
+      },
+      "compressor_pages_before": 178026,
+      "compressor_pages_after": 134538,
+      "mlx_peak_mb": 6194.4,
+      "mlx_active_mb_after": 6010.1,
+      "mlx_peak_gb_incl_pool": 6.194,
+      "free_gb_after": 3.19,
+      "battery_before": 90,
+      "battery_after": 90,
+      "speed_limit": 100,
+      "pressure": 1,
+      "swap_used_mb": 834.5
+     },
+     "idle": {
+      "arm": "idle",
+      "probe_ms": 5.49,
+      "wall_s": 1.76,
+      "read_s": 0.0,
+      "gpu_s": 0.0,
+      "other_s": 1.76,
+      "bytes": 0,
+      "read_gb_s": null,
+      "read_ms_per_layer": null,
+      "gpu_ms_per_layer": null,
+      "staged": 0,
+      "fallbacks": 0,
+      "vm": {
+       "Pageins": 270,
+       "Pageouts": 0,
+       "Swapins": 0,
+       "Swapouts": 0,
+       "Compressions": 0,
+       "Decompressions": 3070
+      },
+      "compressor_pages_before": 134533,
+      "compressor_pages_after": 133513,
+      "mlx_peak_mb": 0.0,
+      "mlx_active_mb_after": 6010.1,
+      "mlx_peak_gb_incl_pool": 0.0,
+      "free_gb_after": 3.49,
+      "battery_before": 90,
+      "battery_after": 90,
+      "speed_limit": 100,
+      "pressure": 1,
+      "swap_used_mb": 834.5
+     }
+    },
+    {
+     "round": 1,
+     "order": [
+      "idle",
+      "on",
+      "off"
+     ],
+     "idle": {
+      "arm": "idle",
+      "probe_ms": 7.46,
+      "wall_s": 1.76,
+      "read_s": 0.0,
+      "gpu_s": 0.0,
+      "other_s": 1.76,
+      "bytes": 0,
+      "read_gb_s": null,
+      "read_ms_per_layer": null,
+      "gpu_ms_per_layer": null,
+      "staged": 0,
+      "fallbacks": 0,
+      "vm": {
+       "Pageins": 156,
+       "Pageouts": 0,
+       "Swapins": 0,
+       "Swapouts": 0,
+       "Compressions": 0,
+       "Decompressions": 1736
+      },
+      "compressor_pages_before": 132069,
+      "compressor_pages_after": 131082,
+      "mlx_peak_mb": 0.0,
+      "mlx_active_mb_after": 6010.1,
+      "mlx_peak_gb_incl_pool": 0.0,
+      "free_gb_after": 3.67,
+      "battery_before": 90,
+      "battery_after": 90,
+      "speed_limit": 100,
+      "pressure": 1,
+      "swap_used_mb": 834.5
+     },
+     "on": {
+      "arm": "on",
+      "probe_ms": 13.82,
+      "ring_stats": {
+       "staged_layers": 4,
+       "fallback_capacity": 0,
+       "fallback_busy": 0,
+       "fallback_error": 0,
+       "fallback_memory": 0,
+       "disabled": null
+      },
+      "wall_s": 1.1399,
+      "read_s": 0.7969,
+      "gpu_s": 0.3392,
+      "other_s": 0.0038,
+      "bytes": 4104192000,
+      "read_gb_s": 5.15,
+      "read_ms_per_layer": 199.2,
+      "gpu_ms_per_layer": 84.8,
+      "staged": 4,
+      "fallbacks": 0,
+      "vm": {
+       "Pageins": 62,
+       "Pageouts": 0,
+       "Swapins": 0,
+       "Swapouts": 0,
+       "Compressions": 2490,
+       "Decompressions": 341
+      },
+      "compressor_pages_before": 129661,
+      "compressor_pages_after": 131311,
+      "mlx_peak_mb": 6194.4,
+      "mlx_active_mb_after": 6010.1,
+      "mlx_peak_gb_incl_pool": 6.194,
+      "free_gb_after": 3.28,
+      "battery_before": 90,
+      "battery_after": 90,
+      "speed_limit": 100,
+      "pressure": 1,
+      "swap_used_mb": 834.5
+     },
+     "off": {
+      "arm": "off",
+      "probe_ms": 5.47,
+      "wall_s": 1.788,
+      "read_s": 1.3769,
+      "gpu_s": 0.406,
+      "other_s": 0.0051,
+      "bytes": 4104192000,
+      "read_gb_s": 2.981,
+      "read_ms_per_layer": 344.2,
+      "gpu_ms_per_layer": 101.5,
+      "staged": 0,
+      "fallbacks": 0,
+      "vm": {
+       "Pageins": 137699,
+       "Pageouts": 2,
+       "Swapins": 0,
+       "Swapouts": 0,
+       "Compressions": 192370,
+       "Decompressions": 46240
+      },
+      "compressor_pages_before": 131309,
+      "compressor_pages_after": 190486,
+      "mlx_peak_mb": 7220.5,
+      "mlx_active_mb_after": 6010.1,
+      "mlx_peak_gb_incl_pool": 7.22,
+      "free_gb_after": 6.3,
+      "battery_before": 90,
+      "battery_after": 90,
+      "speed_limit": 100,
+      "pressure": 1,
+      "swap_used_mb": 834.5
+     }
+    }
+   ],
+   "arm_layers": 4,
+   "bit_identical": true,
+   "digest_layers": 4,
+   "summary": {
+    "speedup_wall_off_over_on": {
+     "n": 2,
+     "median": 1.546,
+     "min": 1.524,
+     "max": 1.569,
+     "mean": 1.546,
+     "stdev": 0.032,
+     "ci95_half_width": 0.286,
+     "on_faster_in": 2
+    },
+    "speedup_read_off_over_on": {
+     "n": 2,
+     "median": 1.788,
+     "min": 1.728,
+     "max": 1.847,
+     "mean": 1.788,
+     "stdev": 0.084,
+     "ci95_half_width": 0.759,
+     "on_faster_in": 2
+    },
+    "gpu_off_over_on": {
+     "n": 2,
+     "median": 1.047,
+     "min": 0.897,
+     "max": 1.197,
+     "mean": 1.047,
+     "stdev": 0.212,
+     "ci95_half_width": 1.906,
+     "on_faster_in": 1
+    },
+    "off": {
+     "median_wall_s": 1.771,
+     "compressions_per_s": 126685,
+     "decompressions_per_s": 42556,
+     "pageins_per_s": 77800,
+     "swapouts": 0,
+     "max_mlx_peak_mb": 7220.5,
+     "max_mlx_peak_gb_incl_pool": 7.22,
+     "min_free_gb": 6.3,
+     "median_read_ms_per_layer": 347.4,
+     "median_gpu_ms_per_layer": 94.4,
+     "median_read_gb_s": 2.95
+    },
+    "on": {
+     "median_wall_s": 1.146,
+     "compressions_per_s": 9685,
+     "decompressions_per_s": 70682,
+     "pageins_per_s": 154,
+     "swapouts": 0,
+     "max_mlx_peak_mb": 6194.4,
+     "max_mlx_peak_gb_incl_pool": 6.194,
+     "min_free_gb": 3.19,
+     "median_read_ms_per_layer": 194.5,
+     "median_gpu_ms_per_layer": 91.0,
+     "median_read_gb_s": 5.28
+    },
+    "idle": {
+     "median_wall_s": 1.76,
+     "compressions_per_s": 0,
+     "decompressions_per_s": 1365,
+     "pageins_per_s": 121,
+     "swapouts": 0,
+     "max_mlx_peak_mb": 0.0,
+     "max_mlx_peak_gb_incl_pool": 0.0,
+     "min_free_gb": 3.49
+    }
+   }
+  }
+ },
+ "aborted": null,
+ "mlx": "0.32.2",
+ "checkpoint_gb": 6.29,
+ "metal_limit_gb": 12.713,
+ "pool_gb": 6.0,
+ "watchdog_reason": null,
+ "end": {
+  "battery": {
+   "percent": 90,
+   "discharging": true,
+   "source": "battery"
+  },
+  "pressure": 1,
+  "speed_limit": 100,
+  "swap_used_mb": 834.5,
+  "free_gb": 6.3,
+  "thermal_text": "Note: No thermal warning level has been recorded | Note: No performance warning level has been recorded | Note: No CPU power status has been recorded"
+ }
+}
