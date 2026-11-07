@@ -34,20 +34,41 @@ Memory
 
 Everything is off unless ``FLASHNEXT_PREFILL_RING_EXPERTS`` is a positive
 number and the expert pool is enabled.
+
+First-turn scratch pool (``FLASHNEXT_PREFILL_RING_SCRATCH=1``, off by default)
+    The 6 GB pool is created at the first decode, so a first-turn prefill has
+    none, and MLX counts a wrapped pool at its full size. Putting the ring in
+    the pool would therefore add the whole pool to the first prefill. With the
+    scratch option, a first-turn prefill (no pool yet) uses a temporary pool
+    sized for the ring alone (the half plus 16 unused slots, about 1.6 GB for
+    512 experts). It is private, never registered with the store, and freed
+    when the session ends: the ring is closed, the GPU fenced, every reference
+    dropped. The normal pool is then created at first decode as before. When
+    the pool already exists (later turns) the ring lives in it as before.
+
+Accounting
+    Memory is counted once: MLX's active memory already contains every wrapped
+    pool, the allocator cache is a separate counter, and a pool that does not
+    exist yet is added once, before it is created. A request that would not fit
+    is refused before anything is allocated.
 """
 from __future__ import annotations
 
 import contextlib
+import gc
+import mmap
 import os
 import time
 from collections import namedtuple
 from concurrent.futures import wait
 
 from .pool_ring import (
-    HazardError, PoolRing, RingError, fits_working_set, plan_ring,
+    MIN_DECODE_SLOTS, HazardError, PoolRing, RingError, fits_working_set,
+    plan_ring, slots_per_half,
 )
 
 FLAG_EXPERTS = "FLASHNEXT_PREFILL_RING_EXPERTS"
+FLAG_SCRATCH = "FLASHNEXT_PREFILL_RING_SCRATCH"
 FLAG_MIN_TOKENS = "FLASHNEXT_PREFILL_RING_MIN_TOKENS"
 FLAG_MARGIN_GB = "FLASHNEXT_PREFILL_RING_MARGIN_GB"
 FLAG_TRANSIENT_GB = "FLASHNEXT_PREFILL_RING_TRANSIENT_GB"
@@ -61,6 +82,11 @@ PartPlan = namedtuple("PartPlan", "name dtype tail row_bytes")
 
 # Why the last acquire declined, for diagnostics and tests.
 LAST_REASON = [None]
+
+# Sessions whose ring would not close in time. Their temporary pool is kept
+# alive on purpose: a writer or a GPU job may still be using it, and freeing
+# the memory under them is worse than holding it.
+_RETAINED = []
 
 
 class RingUnavailable(RuntimeError):
@@ -82,6 +108,14 @@ def configured_experts() -> int:
 
 def enabled() -> bool:
     return configured_experts() > 0
+
+
+def scratch_enabled() -> bool:
+    """Whether a first-turn prefill may use a temporary right-sized pool."""
+    raw = os.environ.get(FLAG_SCRATCH, "0") or "0"
+    if raw not in ("0", "1"):
+        raise ValueError(f"{FLAG_SCRATCH} must be 0 or 1")
+    return raw == "1"
 
 
 def min_tokens() -> int:
@@ -138,6 +172,37 @@ def working_set_bytes(active: int, pool_bytes: int) -> int:
     return active if active >= pool_bytes else active + pool_bytes
 
 
+def pool_length(size_bytes: int, stride: int) -> int:
+    """Bytes ``ExpertPool(store, size_bytes)`` maps: header plus whole records,
+    rounded up to a page. Mirrors ``expert_pool.ExpertPool.__init__``."""
+    from . import expert_pool
+
+    slots = (int(size_bytes) - expert_pool.HEADER) // int(stride)
+    length = expert_pool.HEADER + slots * int(stride)
+    return -(-length // mmap.PAGESIZE) * mmap.PAGESIZE
+
+
+def _release_pool(pool) -> None:
+    """Drop every reference this process holds to a temporary pool.
+
+    Call only when the GPU is idle and the ring is closed. The memory goes back
+    when the last MLX array on the buffer dies; arrays that still view it keep
+    it valid until then, so nothing can read freed memory.
+    """
+    try:
+        pool.close()                    # the file descriptors
+    except Exception:
+        pass
+    pool.buffer_mx = None
+    pool.array = None
+    view, pool._view = getattr(pool, "_view", None), None
+    if view is not None:
+        try:
+            view.release()
+        except (BufferError, ValueError):
+            pass                        # a leftover slice: garbage collection frees it
+
+
 def metal_working_set_limit():
     """Metal's recommended working set in bytes, or None when unknown."""
     import mlx.core as mx
@@ -172,7 +237,7 @@ class PrefillRing:
     def __init__(
         self, pool, ring, plans, submit, resolve, keepwarm=None,
         active_memory=None, limit_bytes=None, margin=0, pool_bytes=0,
-        synchronize=None,
+        synchronize=None, cache_memory=None, owns_pool=False,
     ):
         self.pool = pool
         self.ring = ring
@@ -185,6 +250,9 @@ class PrefillRing:
         self._margin = int(margin)
         self._pool_bytes = int(pool_bytes)
         self._synchronize = synchronize
+        self._cache_memory = cache_memory
+        self.owns_pool = bool(owns_pool)    # a temporary pool this session frees
+        self.disposed = False
         self._pool_view = pool._view
         self._buf32 = None
         self.pending = None
@@ -202,6 +270,8 @@ class PrefillRing:
         snapshot["half_experts"] = self.ring.half_experts
         snapshot["ring_bytes"] = self.ring.ring_bytes
         snapshot["last_error"] = self.last_error
+        snapshot["scratch_pool"] = self.owns_pool
+        snapshot["disposed"] = self.disposed
         return snapshot
 
     # -- one layer ----------------------------------------------------------
@@ -258,6 +328,8 @@ class PrefillRing:
         if self._limit is None or self._active_memory is None:
             return False
         used = working_set_bytes(self._active_memory(), self._pool_bytes)
+        if self._cache_memory is not None:
+            used += self._cache_memory()    # freed-but-kept buffers are not "active"
         return used + self._margin > self._limit
 
     def _queue_reads(self, lease, store, switch_prefix, wanted):
@@ -324,6 +396,9 @@ class PrefillRing:
         lease.release()
 
     def finish(self) -> None:
+        """Normal end: wait for the GPU, then release the last half."""
+        if self._synchronize is not None:
+            self._synchronize()
         self._retire()
 
     def abort(self) -> None:
@@ -337,6 +412,35 @@ class PrefillRing:
 
     def close(self) -> bool:
         return self.ring.close(timeout=CLOSE_TIMEOUT)
+
+    def dispose(self) -> bool:
+        """Free a temporary pool. Returns True when it was freed.
+
+        Call only after ``close()`` returned True. The GPU is fenced first, so
+        no kernel is still reading the buffer when the last reference goes,
+        and nothing here frees memory a lazily evaluated array still views.
+        """
+        if not self.owns_pool or self.disposed:
+            return False
+        if self._synchronize is not None:
+            self._synchronize()
+        pool = self.pool
+        self._buf32 = None
+        self.pending = None
+        self.ring.pool = None
+        self.pool = None
+        self._pool_view = None
+        _release_pool(pool)
+        self.disposed = True
+        del pool
+        gc.collect()
+        try:
+            import mlx.core as mx
+
+            mx.clear_cache()
+        except Exception:
+            pass
+        return True
 
 
 def acquire(language, tokens: int):
@@ -379,67 +483,115 @@ def acquire(language, tokens: int):
     except RingUnavailable as error:
         LAST_REASON[0] = str(error)
         return None
-    pool = expert_pool.for_store(store, first.gate_proj.group_size)
-    if pool is None:
-        LAST_REASON[0] = "no pool"
-        return None
+    group_size = first.gate_proj.group_size
     expert_bytes = sum(plan.row_bytes for plan in plans)
-    half_experts = plan_ring(
-        pool.slots, pool.stride, expert_bytes,
-        min(requested, first.gate_proj.num_experts),
-        max_pool_fraction=0.5, halves=1,
-    )
-    if half_experts <= 0:
-        LAST_REASON[0] = "pool too small"
-        return None
+    wanted_experts = min(requested, first.gate_proj.num_experts)
+    stride = expert_pool.get_slab_layout(group_size).record_stride
     limit = metal_working_set_limit()
-    pool_bytes = len(pool._mm)
     if limit is None:
         LAST_REASON[0] = "working-set limit unknown"
         return None
+
+    existing = getattr(store, "_flashnext_expert_pool", None)
+    scratch = existing is None and scratch_enabled()
     active = mx.get_active_memory()
-    used = working_set_bytes(active, pool_bytes)
+    cache = mx.get_cache_memory()
+    if existing is not None:
+        # Later turn: the ring lives in the pool, which active memory contains.
+        pool_bytes = len(existing._mm)
+        used = working_set_bytes(active, pool_bytes) + cache
+        pool_note = f"includes the {pool_bytes / 1e9:.2f} GB pool"
+        new_bytes, scratch_size = 0, 0
+    else:
+        # First turn: the pool does not exist yet, so add it once, before it
+        # is created. Refusing here leaves nothing allocated.
+        if scratch:
+            scratch_size = expert_pool.HEADER + stride * (
+                slots_per_half(wanted_experts, expert_bytes, stride) + MIN_DECODE_SLOTS
+            )
+            new_bytes = pool_length(scratch_size, stride)
+            kind = "scratch pool"
+        else:
+            scratch_size = 0
+            new_bytes = pool_length(int(expert_pool.configured_gb() * 1e9), stride)
+            kind = "pool created for the ring"
+        used = active + cache + new_bytes
+        pool_note = f"no pool yet; {kind} {new_bytes / 1e9:.2f} GB added"
     if not fits_working_set(0, used + transient_bytes(), limit, margin_bytes()):
         LAST_REASON[0] = (
-            f"working set: MLX active {active / 1e9:.2f} GB (includes the "
-            f"{pool_bytes / 1e9:.2f} GB pool) + transient "
-            f"{transient_bytes() / 1e9:.2f} GB + margin "
-            f"{margin_bytes() / 1e9:.2f} GB exceeds limit {limit / 1e9:.2f} GB"
+            f"working set: MLX active {active / 1e9:.2f} GB ({pool_note}) + cache "
+            f"{cache / 1e9:.2f} GB + transient {transient_bytes() / 1e9:.2f} GB + "
+            f"margin {margin_bytes() / 1e9:.2f} GB exceeds limit {limit / 1e9:.2f} GB"
         )
         return None
-    try:
-        ring = PoolRing(
-            pool, [(plan.name, plan.row_bytes) for plan in plans], half_experts,
-            header=expert_pool.HEADER, halves=1,
-        )
-    except RingError as error:
-        LAST_REASON[0] = f"lease refused: {error}"
+
+    if existing is not None:
+        pool = existing
+    elif scratch:
+        pool = expert_pool.ExpertPool(store, scratch_size, group_size)   # temporary
+    else:
+        pool = expert_pool.for_store(store, group_size)
+    if pool is None:
+        LAST_REASON[0] = "no pool"
+        return None
+    half_experts = plan_ring(
+        pool.slots, pool.stride, expert_bytes, wanted_experts,
+        max_pool_fraction=1.0 if scratch else 0.5, halves=1,
+    )
+    ring = None
+    if half_experts <= 0:
+        LAST_REASON[0] = "pool too small"
+    else:
+        try:
+            ring = PoolRing(
+                pool, [(plan.name, plan.row_bytes) for plan in plans], half_experts,
+                header=expert_pool.HEADER, halves=1,
+            )
+        except RingError as error:
+            LAST_REASON[0] = f"lease refused: {error}"
+    if ring is None:
+        if scratch:
+            _release_pool(pool)
+            del pool
+            gc.collect()
         return None
     keepwarm = expert_cache._keep_gpu_warm_until if expert_cache._KEEPWARM[0] else None
     state = PrefillRing(
         pool, ring, plans, expert_cache._submit_read, expert_cache._resolve_future,
         keepwarm=keepwarm, active_memory=mx.get_active_memory,
-        limit_bytes=limit, margin=margin_bytes(), pool_bytes=pool_bytes,
-        synchronize=fence,
+        limit_bytes=limit, margin=margin_bytes(), pool_bytes=len(pool._mm),
+        synchronize=fence, cache_memory=mx.get_cache_memory, owns_pool=scratch,
     )
     expert_cache.set_prefill_ring(state)
     return state
 
 
 def release(state, failed: bool = False) -> None:
-    """Return the ring. Safe on every exit path, including cancellation."""
+    """Return the ring. Safe on every exit path, including cancellation.
+
+    Order: stop routing layers to the ring, wait for the GPU (``abort`` or
+    ``finish`` fence), close the ring, and only then free a temporary pool. If
+    the ring does not close in time a writer may still be active, so the
+    temporary pool is kept alive rather than freed under it.
+    """
     if state is None:
         return
     from . import expert_cache
 
     expert_cache.set_prefill_ring(None)
+    closed = False
     try:
         if failed:
             state.abort()
         else:
             state.finish()
     finally:
-        state.close()
+        closed = state.close()
+        if closed:
+            state.dispose()
+        elif state.owns_pool and not state.disposed:
+            _RETAINED.append(state)
+            LAST_REASON[0] = "ring did not close in time; temporary pool retained"
 
 
 @contextlib.contextmanager

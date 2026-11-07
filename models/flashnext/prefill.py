@@ -116,22 +116,31 @@ def prefill_target(
 ):
     """Push one target prompt through the model and seed its next token.
 
-    With ``FLASHNEXT_PREFILL_RING_EXPERTS`` unset (the default) this is exactly
-    ``_prefill_target``. When set, the prefill holds the in-pool read ring for
-    its duration; see ``prefill_ring``.
+    With ``FLASHNEXT_PREFILL_RING_EXPERTS`` and ``FLASHNEXT_PREFILL_CACHE_LIMIT_MB``
+    both unset (the default) this is exactly ``_prefill_target``. The cache
+    limit (``prefill_memory``) caps MLX's allocator cache for the call; the ring
+    (``prefill_ring``) holds the in-pool read ring, or with
+    ``FLASHNEXT_PREFILL_RING_SCRATCH=1`` a temporary pool on a first turn.
     """
-    from models.flashnext import prefill_ring
+    from models.flashnext import prefill_memory, prefill_ring
 
-    if not prefill_ring.enabled():
+    ring_on = prefill_ring.enabled()
+    cap_on = prefill_memory.enabled()
+    if not ring_on and not cap_on:
         return _prefill_target(
             language, ids, cache, want_logits, want_hidden, sampler,
         )
-    with prefill_ring.session(language, int(ids.shape[1])) as ring:
-        result = _prefill_target(
-            language, ids, cache, want_logits, want_hidden, sampler,
-        )
-        if ring is not None:
-            # Nothing the caller keeps may still read ring memory lazily.
-            mx.eval([item for item in result if item is not None])
-            prefill_ring.fence()
-        return result
+    with prefill_memory.cache_cap():
+        if not ring_on:
+            return _prefill_target(
+                language, ids, cache, want_logits, want_hidden, sampler,
+            )
+        with prefill_ring.session(language, int(ids.shape[1])) as ring:
+            result = _prefill_target(
+                language, ids, cache, want_logits, want_hidden, sampler,
+            )
+            if ring is not None:
+                # Nothing the caller keeps may still read ring memory lazily.
+                mx.eval([item for item in result if item is not None])
+                prefill_ring.fence()
+            return result

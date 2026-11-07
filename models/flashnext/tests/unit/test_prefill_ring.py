@@ -7,10 +7,12 @@ intermediate 640, Q4/G32) stands in for the model. Two real
 """
 from __future__ import annotations
 
+import gc
 import hashlib
 import json
 import os
 import tempfile
+import time
 import unittest
 from types import SimpleNamespace
 from unittest import mock
@@ -75,6 +77,8 @@ class RingCase(unittest.TestCase):
     """Builds the store, pool and two streamed layers once per test."""
 
     pool_gb = "0.15"
+    create_main_pool = True         # False: a first turn, before any decode pool
+    extra_env = {}
 
     @classmethod
     def setUpClass(cls):
@@ -87,7 +91,8 @@ class RingCase(unittest.TestCase):
 
     def setUp(self):
         patcher = mock.patch.dict(
-            os.environ, {**ENV, "FLASHNEXT_EXPERT_POOL_GB": self.pool_gb})
+            os.environ,
+            {**ENV, "FLASHNEXT_EXPERT_POOL_GB": self.pool_gb, **self.extra_env})
         patcher.start()
         self.addCleanup(patcher.stop)
         self.store = SafeTensorStore(self.directory.name)
@@ -103,10 +108,13 @@ class RingCase(unittest.TestCase):
             SimpleNamespace(mlp=SimpleNamespace(switch_mlp=glu))
             for glu in self.layers
         ]))
-        self.pool = expert_pool.for_store(self.store, 32)
-        self.addCleanup(self.pool.close)
         self.addCleanup(expert_cache.set_prefill_ring, None)
-        self.free_before = sorted(self.pool._free)
+        self.pool = None
+        self.free_before = None
+        if self.create_main_pool:
+            self.pool = expert_pool.for_store(self.store, 32)
+            self.addCleanup(self.pool.close)
+            self.free_before = sorted(self.pool._free)
 
     def inputs(self, tokens=16, width=4, seed=3, experts=8):
         """Routes over the first ``experts`` experts (the ring half holds 8)."""
@@ -325,7 +333,8 @@ class AcquireTests(RingCase):
         # contains the pool, which must count once.
         active = len(self.pool._mm) + 100_000_000
         limit = active + 400_000_000
-        with mock.patch.object(mx, "get_active_memory", return_value=active):
+        with mock.patch.object(mx, "get_active_memory", return_value=active), \
+                mock.patch.object(mx, "get_cache_memory", return_value=0):
             with mock.patch.object(
                 prefill_ring, "metal_working_set_limit", return_value=limit
             ):
@@ -368,7 +377,8 @@ class AcquireTests(RingCase):
         active = pool_bytes + 100_000_000
         limit = active + 100_000_000 + 500_000_000 + 50_000_000
         self.assertLess(limit - active, pool_bytes + 100_000_000 + 500_000_000)
-        with mock.patch.object(mx, "get_active_memory", return_value=active):
+        with mock.patch.object(mx, "get_active_memory", return_value=active), \
+                mock.patch.object(mx, "get_cache_memory", return_value=0):
             with mock.patch.object(
                 prefill_ring, "metal_working_set_limit", return_value=limit
             ):
@@ -469,6 +479,361 @@ class OwnershipTests(RingCase):
             with self.assertRaises(HazardError):
                 with lease.writing():
                     pass
+
+
+class ScratchBase(RingCase):
+    """A first turn: no decode pool exists yet, as in a fresh process."""
+
+    create_main_pool = False
+    extra_env = {"FLASHNEXT_PREFILL_RING_SCRATCH": "1"}
+
+    def stride(self):
+        return expert_pool.get_slab_layout(32).record_stride
+
+    def scratch_bytes(self, experts=8):
+        stride = self.stride()
+        slots = experts + 16                      # the half plus 16 unused slots
+        return prefill_ring.pool_length(expert_pool.HEADER + slots * stride, stride)
+
+    def stable_active(self, seconds=10.0):
+        """Active memory once MLX has finished freeing earlier tests' arrays:
+        three reads in a row within 1 MB."""
+        deadline = time.time() + seconds
+        reads = []
+        while time.time() < deadline:
+            gc.collect()
+            prefill_ring.fence()
+            reads.append(mx.get_active_memory())
+            reads = reads[-3:]
+            if len(reads) == 3 and max(reads) - min(reads) < 1_000_000:
+                return reads[-1]
+            time.sleep(0.1)
+        self.fail("active memory did not settle")
+
+    def settle(self, ceiling, tolerance=16_000_000, seconds=5.0):
+        """True once active memory is back at ``ceiling``. MLX frees buffers
+        asynchronously, so poll instead of reading once."""
+        deadline = time.time() + seconds
+        while True:
+            gc.collect()
+            prefill_ring.fence()
+            if mx.get_active_memory() <= ceiling + tolerance:
+                return True
+            if time.time() > deadline:
+                return False
+            time.sleep(0.05)
+
+    def no_decode_pool(self):
+        return getattr(self.store, "_flashnext_expert_pool", None) is None
+
+
+class FirstTurnScratchTests(ScratchBase):
+    def test_a_first_turn_uses_a_private_pool_and_never_creates_the_decode_pool(self):
+        x, indices = self.inputs()
+        reference = self.run_layers(x, indices)
+        baseline = self.stable_active()
+        with prefill_ring.session(self.language, 1024) as ring:
+            self.assertIsNotNone(ring, prefill_ring.LAST_REASON[0])
+            self.assertTrue(ring.owns_pool)
+            self.assertTrue(self.no_decode_pool())
+            produced = self.run_layers(x, indices)
+            private = len(ring.pool._mm)
+            temporary = ring.pool
+            self.assertTrue(temporary._fds)            # reads opened descriptors
+            during = mx.get_active_memory() - baseline
+            stats = ring.stats()
+        for got, want in zip(produced, reference):
+            self.assertTrue(bool(mx.array_equal(got, want)))
+        self.assertEqual(stats["staged_layers"], len(LAYERS))
+        self.assertTrue(stats["scratch_pool"])
+        # Sized for the ring alone: the half plus 16 slots, not the configured pool.
+        self.assertEqual(private, self.scratch_bytes())
+        self.assertLess(private, 0.6 * expert_pool.configured_gb() * 1e9)
+        self.assertGreaterEqual(during, 0.98 * private)
+        self.assertLess(during, private + 32_000_000)
+        self.assertTrue(self.no_decode_pool())
+        # Nothing of the temporary pool is left holding the memory or a file.
+        self.assertEqual(temporary._fds, {})
+        self.assertIsNone(temporary.buffer_mx)
+        self.assertIsNone(temporary.array)
+        self.assertIsNone(temporary._view)
+        self.assertIsNone(ring.pool)
+        self.assertIsNone(ring.ring.pool)
+        del produced
+        self.assertTrue(self.settle(baseline), "temporary pool memory was not returned")
+
+    def test_the_temporary_pool_is_gone_before_the_decode_pool_is_created(self):
+        x, indices = self.inputs()
+        self.run_layers(x, indices)
+        baseline = self.stable_active()
+        with prefill_ring.session(self.language, 1024) as ring:
+            self.run_layers(x, indices)
+            state = ring
+        self.assertTrue(state.disposed)
+        self.assertTrue(self.settle(baseline))
+        main = expert_pool.for_store(self.store, 32)        # what the first decode does
+        self.addCleanup(main.close)
+        grown = mx.get_active_memory() - baseline
+        # Only the decode pool: a leftover temporary pool would add 74 MB.
+        self.assertGreaterEqual(grown, 0.98 * len(main._mm))
+        self.assertLess(grown, len(main._mm) + 16_000_000)
+
+    def test_later_turns_put_the_ring_in_the_decode_pool(self):
+        x, indices = self.inputs()
+        reference = self.run_layers(x, indices)
+        with prefill_ring.session(self.language, 1024) as first:
+            self.assertTrue(first.owns_pool)
+            self.run_layers(x, indices)
+        main = expert_pool.for_store(self.store, 32)
+        self.addCleanup(main.close)
+        free_before = sorted(main._free)
+        with prefill_ring.session(self.language, 1024) as second:
+            self.assertIsNotNone(second, prefill_ring.LAST_REASON[0])
+            self.assertFalse(second.owns_pool)
+            self.assertIs(second.pool, main)
+            produced = self.run_layers(x, indices)
+        for got, want in zip(produced, reference):
+            self.assertTrue(bool(mx.array_equal(got, want)))
+        self.assertFalse(second.disposed)
+        self.assertEqual(sorted(main._free), free_before)
+        self.assertIsNone(expert_cache._PREFILL_RING[0])
+
+    def test_two_first_turn_prefills_in_a_row_each_get_and_free_their_own_pool(self):
+        x, indices = self.inputs()
+        reference = self.run_layers(x, indices)
+        baseline = self.stable_active()
+        for _ in range(2):
+            with prefill_ring.session(self.language, 1024) as ring:
+                produced = self.run_layers(x, indices)
+            for got, want in zip(produced, reference):
+                self.assertTrue(bool(mx.array_equal(got, want)))
+            self.assertTrue(ring.disposed)
+            del produced
+            self.assertTrue(self.settle(baseline))
+        self.assertTrue(self.no_decode_pool())
+
+    def test_without_the_flag_a_first_turn_behaves_as_before(self):
+        with mock.patch.dict(os.environ, {"FLASHNEXT_PREFILL_RING_SCRATCH": "0"}):
+            with prefill_ring.session(self.language, 1024) as ring:
+                self.assertIsNotNone(ring, prefill_ring.LAST_REASON[0])
+                self.assertFalse(ring.owns_pool)
+                pool = getattr(self.store, "_flashnext_expert_pool", None)
+                self.assertIsNotNone(pool)             # the ring created the pool
+                self.assertIs(ring.pool, pool)
+        self.addCleanup(pool.close)
+        self.assertFalse(ring.disposed)
+
+    def test_the_flag_is_parsed_strictly(self):
+        for value, expected in (("0", False), ("1", True)):
+            with mock.patch.dict(os.environ, {"FLASHNEXT_PREFILL_RING_SCRATCH": value}):
+                self.assertEqual(prefill_ring.scratch_enabled(), expected)
+        with mock.patch.dict(os.environ, {"FLASHNEXT_PREFILL_RING_SCRATCH": "yes"}):
+            with self.assertRaises(ValueError):
+                prefill_ring.scratch_enabled()
+        os.environ.pop("FLASHNEXT_PREFILL_RING_SCRATCH")
+        self.assertFalse(prefill_ring.scratch_enabled())
+
+    def test_pool_length_matches_what_a_real_pool_maps(self):
+        stride = self.stride()
+        for slots in (16, 24, 33):
+            size = expert_pool.HEADER + slots * stride + 12345   # a ragged size
+            pool = expert_pool.ExpertPool(self.store, size, 32)
+            try:
+                self.assertEqual(len(pool._mm), prefill_ring.pool_length(size, stride))
+            finally:
+                pool.close()
+
+
+class ScratchMemoryPressureTests(ScratchBase):
+    def accounting(self, active, cache, limit):
+        return (
+            mock.patch.object(mx, "get_active_memory", return_value=active),
+            mock.patch.object(mx, "get_cache_memory", return_value=cache),
+            mock.patch.object(prefill_ring, "metal_working_set_limit", return_value=limit),
+        )
+
+    def test_refused_before_anything_is_allocated(self):
+        active = 1_000_000_000
+        room = 100_000_000 + 500_000_000                      # transient + margin
+        exact = active + self.scratch_bytes() + room
+        a, c, l = self.accounting(active, 0, exact - 1)
+        with a, c, l, mock.patch.object(expert_pool, "ExpertPool") as made:
+            self.assertIsNone(prefill_ring.acquire(self.language, 1024))
+            made.assert_not_called()
+        self.assertTrue(
+            prefill_ring.LAST_REASON[0].startswith("working set: MLX active"),
+            prefill_ring.LAST_REASON[0])
+        self.assertIn("scratch pool", prefill_ring.LAST_REASON[0])
+        self.assertTrue(self.no_decode_pool())
+        # One byte more room and it is accepted, so the pool is counted once.
+        a, c, l = self.accounting(active, 0, exact)
+        with a, c, l:
+            state = prefill_ring.acquire(self.language, 1024)
+            self.assertIsNotNone(state, prefill_ring.LAST_REASON[0])
+            prefill_ring.release(state)
+
+    def test_the_allocator_cache_counts_once_beside_the_new_pool(self):
+        active, cache = 1_000_000_000, 200_000_000
+        exact = active + cache + self.scratch_bytes() + 600_000_000
+        a, c, l = self.accounting(active, cache, exact - 1)
+        with a, c, l:
+            self.assertIsNone(prefill_ring.acquire(self.language, 1024))
+        a, c, l = self.accounting(active, cache, exact)
+        with a, c, l:
+            state = prefill_ring.acquire(self.language, 1024)
+            self.assertIsNotNone(state, prefill_ring.LAST_REASON[0])
+            prefill_ring.release(state)
+
+    def test_without_scratch_a_first_turn_is_refused_before_the_decode_pool_exists(self):
+        with mock.patch.dict(os.environ, {"FLASHNEXT_PREFILL_RING_SCRATCH": "0"}):
+            a, c, l = self.accounting(1_000_000_000, 0, 1_500_000_000)
+            with a, c, l, mock.patch.object(expert_pool, "for_store") as made:
+                self.assertIsNone(prefill_ring.acquire(self.language, 1024))
+                made.assert_not_called()
+            self.assertIn("pool created for the ring", prefill_ring.LAST_REASON[0])
+            self.assertTrue(self.no_decode_pool())
+
+    def test_pressure_during_the_prefill_disables_the_ring_and_still_frees_the_pool(self):
+        baseline = self.stable_active()
+        with prefill_ring.session(self.language, 1024) as ring:
+            self.assertIsNotNone(ring.stage(self.store, prefix_of(1), [0, 1]))
+            ring._active_memory = lambda: ring._limit            # no room left
+            self.assertIsNone(ring.stage(self.store, prefix_of(2), [0, 1]))
+            self.assertEqual(ring.disabled, "working set")
+        self.assertTrue(ring.disposed)
+        self.assertTrue(self.settle(baseline))
+
+    def test_a_pool_too_small_for_the_layout_frees_what_it_made(self):
+        baseline = self.stable_active()
+        with mock.patch.object(prefill_ring, "plan_ring", return_value=0):
+            self.assertIsNone(prefill_ring.acquire(self.language, 1024))
+        self.assertEqual(prefill_ring.LAST_REASON[0], "pool too small")
+        self.assertIsNone(expert_cache._PREFILL_RING[0])
+        self.assertTrue(self.settle(baseline))
+
+
+class ScratchCleanupTests(ScratchBase):
+    def test_an_exception_frees_the_temporary_pool(self):
+        baseline = self.stable_active()
+        with self.assertRaises(RuntimeError):
+            with prefill_ring.session(self.language, 1024) as ring:
+                state = ring
+                ring.stage(self.store, prefix_of(1), [0, 1, 2])
+                raise RuntimeError("fail")
+        self.assertTrue(state.disposed)
+        self.assertIsNone(expert_cache._PREFILL_RING[0])
+        self.assertTrue(self.no_decode_pool())
+        self.assertTrue(self.settle(baseline))
+
+    def test_cancellation_during_a_read_frees_the_temporary_pool(self):
+        baseline = self.stable_active()
+        with self.assertRaises(KeyboardInterrupt):
+            with prefill_ring.session(self.language, 1024) as ring:
+                state = ring
+                ring._resolve = mock.Mock(side_effect=KeyboardInterrupt())
+                ring.stage(self.store, prefix_of(1), [0, 1, 2, 3])
+        self.assertTrue(state.disposed)
+        self.assertIsNone(expert_cache._PREFILL_RING[0])
+        self.assertTrue(self.settle(baseline))
+
+    def test_releasing_twice_is_safe(self):
+        with prefill_ring.session(self.language, 1024) as ring:
+            state = ring
+            ring.stage(self.store, prefix_of(1), [0, 1])
+        self.assertTrue(state.disposed)
+        prefill_ring.release(state)                    # a second release
+        prefill_ring.release(state, failed=True)       # and an abort after it
+        self.assertFalse(state.dispose())              # nothing left to free
+
+    def test_a_ring_that_will_not_close_keeps_its_pool_alive(self):
+        with prefill_ring.session(self.language, 1024) as ring:
+            state = ring
+            ring.stage(self.store, prefix_of(1), [0, 1])
+            real_close = ring.ring.close
+            ring.ring.close = lambda timeout=None: False
+        try:
+            self.assertFalse(state.disposed)
+            self.assertIn(state, prefill_ring._RETAINED)
+            self.assertIn("retained", prefill_ring.LAST_REASON[0])
+            self.assertIsNotNone(state.pool)           # not freed under a writer
+            self.assertIsNone(expert_cache._PREFILL_RING[0])
+        finally:
+            state.ring.close = real_close
+            prefill_ring._RETAINED.remove(state)
+            self.assertTrue(state.close())
+            self.assertTrue(state.dispose())
+
+
+class ScratchGpuSafetyTests(ScratchBase):
+    def test_a_release_with_gpu_work_in_flight_never_loses_the_data(self):
+        x, indices = self.inputs()
+        reference = self.run_layers(x, indices)
+        for _ in range(3):
+            with prefill_ring.session(self.language, 1024):
+                lazy = self.layers[0](x, indices)      # stages into the private pool
+                mx.async_eval(lazy)                    # the GPU is reading it now
+            # The session ended at once: the pool was freed behind a fence.
+            self.assertTrue(bool(mx.array_equal(lazy, reference[0])))
+            del lazy
+
+    def test_the_gpu_is_fenced_before_the_temporary_pool_is_freed(self):
+        log = []
+        with prefill_ring.session(self.language, 1024) as ring:
+            ring._synchronize = lambda: log.append("fence")
+            real_close = ring.pool.close
+            ring.pool.close = lambda: (log.append("free"), real_close())[1]
+            ring.stage(self.store, prefix_of(1), [0, 1])
+        self.assertIn("free", log)
+        at = log.index("free")
+        self.assertGreaterEqual(at, 1)
+        self.assertEqual(log[at - 1], "fence")         # the last thing before the free
+        self.assertEqual(log.count("free"), 1)
+
+    def test_a_failed_prefill_fences_twice_before_the_free(self):
+        log = []
+        with self.assertRaises(RuntimeError):
+            with prefill_ring.session(self.language, 1024) as ring:
+                ring._synchronize = lambda: log.append("fence")
+                real_close = ring.pool.close
+                ring.pool.close = lambda: (log.append("free"), real_close())[1]
+                ring.stage(self.store, prefix_of(1), [0, 1])
+                raise RuntimeError("fail")
+        self.assertEqual(log, ["fence", "fence", "free"])   # abort, then dispose
+
+
+class AccountingTests(RingCase):
+    """Memory is counted once: the pool inside active memory, the cache beside it."""
+
+    def test_the_cache_and_the_pool_each_count_once_at_acquire(self):
+        pool_bytes = len(self.pool._mm)
+        active, cache = pool_bytes + 100_000_000, 200_000_000
+        exact = active + cache + 600_000_000
+        for limit, accepted in ((exact - 1, False), (exact, True)):
+            with mock.patch.object(mx, "get_active_memory", return_value=active), \
+                    mock.patch.object(mx, "get_cache_memory", return_value=cache), \
+                    mock.patch.object(
+                        prefill_ring, "metal_working_set_limit", return_value=limit):
+                state = prefill_ring.acquire(self.language, 1024)
+                self.assertEqual(state is not None, accepted, prefill_ring.LAST_REASON[0])
+                prefill_ring.release(state)
+
+    def test_the_per_layer_guard_counts_the_cache_and_the_pool_once(self):
+        pool_bytes = len(self.pool._mm)
+        with prefill_ring.session(self.language, 1024) as ring:
+            ring._active_memory = lambda: pool_bytes + 10
+            ring._cache_memory = lambda: 20
+            ring._limit = pool_bytes + 30 + ring._margin
+            self.assertFalse(ring._over_limit())        # exactly at the limit
+            ring._limit -= 1
+            self.assertTrue(ring._over_limit())         # one byte over
+            ring._cache_memory = None                   # no cache reader: ignored
+            self.assertFalse(ring._over_limit())
+
+    def test_a_cache_alone_can_push_the_ring_over(self):
+        with prefill_ring.session(self.language, 1024) as ring:
+            ring._active_memory = lambda: 0
+            ring._cache_memory = lambda: ring._limit
+            self.assertTrue(ring._over_limit())
 
 
 class PrefillHookTests(RingCase):

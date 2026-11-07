@@ -94,6 +94,8 @@ SETTINGS = (
     research("prefill-ring-min-tokens", "FLASHNEXT_PREFILL_RING_MIN_TOKENS", "512", "startup", integer, unset="512"),
     research("prefill-ring-margin-gb", "FLASHNEXT_PREFILL_RING_MARGIN_GB", "0.5", "startup", float, unset="0.5"),
     research("prefill-ring-transient-gb", "FLASHNEXT_PREFILL_RING_TRANSIENT_GB", "2.0", "startup", float, unset="2.0"),
+    research("prefill-ring-scratch", "FLASHNEXT_PREFILL_RING_SCRATCH", "0", "startup", choice(("0", "1"), "prefill-ring-scratch"), unset="0"),
+    research("prefill-cache-limit-mb", "FLASHNEXT_PREFILL_CACHE_LIMIT_MB", "0", "startup", integer, unset="0"),
     research("compile-hc", "FLASHNEXT_COMPILE_HC", "1", parser=choice(("0", "1"), "compile-hc"), unset="0"),
     research("compile-norm", "FLASHNEXT_COMPILE_NORM", "1", parser=choice(("0", "1"), "compile-norm"), unset="0"),
     research("stream-embed", "FLASHNEXT_STREAM_EMBED", "1", "startup", choice(("0", "1"), "stream-embed"), unset="0"),
