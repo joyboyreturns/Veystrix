@@ -65,7 +65,7 @@ class SettingsRegistryTests(unittest.TestCase):
                 if (is_get or is_getenv) and node.args:
                     argument = node.args[0]
                     if isinstance(argument, ast.Constant) and isinstance(argument.value, str):
-                        found.update(re.findall(r"FLASHNEXT_[A-Z0-9_]+", argument.value))
+                        found.update(re.findall(r"(?<![A-Z0-9_])FLASHNEXT_[A-Z0-9_]+", argument.value))
                 self.generic_visit(node)
 
             def visit_Subscript(self, node):
@@ -78,7 +78,7 @@ class SettingsRegistryTests(unittest.TestCase):
                 )
                 key = node.slice
                 if is_environ and isinstance(key, ast.Constant) and isinstance(key.value, str):
-                    found.update(re.findall(r"FLASHNEXT_[A-Z0-9_]+", key.value))
+                    found.update(re.findall(r"(?<![A-Z0-9_])FLASHNEXT_[A-Z0-9_]+", key.value))
                 self.generic_visit(node)
 
         for path in root.rglob("*.py"):
