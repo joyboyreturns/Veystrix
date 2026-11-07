@@ -929,6 +929,23 @@ class OrchestratorTests(unittest.TestCase):
         self.assertTrue(start["sources"])
         self.assertEqual(start["schedule"][0], "1k-F0-r1")
 
+    def test_the_record_says_whether_the_run_can_support_a_speed_claim(self):
+        self.run_it(self.args(rounds=1))
+        meta = self.records()[0]["metadata"]
+        self.assertFalse(meta["speed_evidence"])
+        self.assertIn("not a speed measurement", meta["cache_warning"])
+        self.setUp()
+        self.run_it(self.args(rounds=3, conditions=["F0"]))
+        meta = self.records()[0]["metadata"]
+        self.assertTrue(meta["speed_evidence"])
+        self.assertIsNone(meta["cache_warning"])
+
+    def test_a_short_run_prints_the_cache_warning(self):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            B.orchestrate(self.args(rounds=1), sampler=self.sampler(), popen=self.popen(), sleep=lambda s: None)
+        self.assertIn("not a speed measurement", out.getvalue())
+
     def test_children_run_in_the_scheduled_reversed_order(self):
         self.run_it()
         ids = [c[c.index("--arm-id") + 1] for c, _ in self.launched]
@@ -1084,6 +1101,176 @@ class OrchestratorTests(unittest.TestCase):
     def test_destinations_outside_results_are_refused(self):
         with self.assertRaises(ValueError):
             self.run_it(self.args(record=str(Path(self.directory.name) / "elsewhere.jsonl")))
+
+
+class CharTokenizer:
+    """One token per character: enough for the conversation framing code."""
+
+    def encode(self, text, add_special_tokens=False):
+        return [ord(c) for c in text]
+
+    def decode(self, ids):
+        return "".join(chr(i) for i in ids)
+
+    def apply_chat_template(self, messages, tools=None, add_generation_prompt=True, tokenize=False,
+                            enable_thinking=True, reasoning_effort=None):
+        body = "".join(f"<|im_start|>{m['role']}\n{m['content']}<|im_end|>\n" for m in messages)
+        return body + "<|im_start|>assistant\n<think>\n\n</think>\n\n"
+
+
+def ready_args(**changes):
+    base = dict(checkpoint="/models/ckpt", sizes=["1k"], conditions=["F0", "F2"], rounds=1, final=False)
+    base.update(changes)
+    return SimpleNamespace(**base)
+
+
+def ready_preflight(verdict="READY"):
+    return SimpleNamespace(check_checkpoint=lambda path: SimpleNamespace(
+        verdict=verdict, by_status=lambda status: [1] if (status == "FAIL" and verdict != "READY") else []))
+
+
+class ReadinessTests(unittest.TestCase):
+    """``--check-ready``: everything the smoke test needs, checked without starting it."""
+
+    def run_ready(self, args=None, sizes=None, contract=lambda: [], sampler=None, preflight=None,
+                  environ=None, free_gb=8.0, resolved="/models/ckpt"):
+        rows = sizes if sizes is not None else [
+            {"size": "1k", "target": 1024, "first": 1025, "later": 1024}]
+        with mock.patch.object(B, "prompt_sizes", return_value=rows), \
+                mock.patch("macqwen.checkpoints.resolve_flashnext", return_value=Path(resolved)):
+            return B.check_ready(
+                args or ready_args(), sampler=sampler or SimpleNamespace(sample=lambda: good_sample()),
+                preflight_module=preflight or ready_preflight(), tokenizer_loader=lambda path: CharTokenizer(),
+                contract=contract, environ=environ if environ is not None else {}, free_gb=free_gb)
+
+    def status(self, report, name):
+        return next(c.status for c in report.checks if c.name == name)
+
+    def test_a_good_machine_and_checkpoint_is_ready(self):
+        report = self.run_ready()
+        self.assertEqual(report.verdict, "READY", report.text())
+        for name in ("checkpoint preflight", "backend API", "prompt size 1k", "machine state", "schedule"):
+            self.assertEqual(self.status(report, name), "PASS", name)
+
+    def test_the_schedule_lists_the_smoke_arms(self):
+        text = self.run_ready().text()
+        self.assertIn("2 fresh-process arms", text)
+        self.assertIn("1k-F0-r1", text)
+        self.assertIn("1k-F2-r1", text)
+
+    def test_a_checkpoint_that_is_not_ready_blocks_the_smoke_test(self):
+        for verdict in ("INCOMPLETE", "INCOMPATIBLE", "MISSING"):
+            report = self.run_ready(preflight=ready_preflight(verdict))
+            self.assertEqual(report.verdict, "BLOCKED", verdict)
+            self.assertEqual(self.status(report, "checkpoint preflight"), "FAIL", verdict)
+
+    def test_a_changed_backend_api_blocks_before_a_model_loads(self):
+        report = self.run_ready(contract=lambda: ["FlashNextBackend.generate lacks parameter on_prefilled"])
+        self.assertEqual(report.verdict, "BLOCKED")
+        self.assertIn("on_prefilled", next(c.detail for c in report.checks if c.name == "backend API"))
+
+    def test_the_machine_state_rules_are_the_watchdogs(self):
+        for changes in ({"low_power": True}, {"power_source": "battery", "battery_percent": 20},
+                        {"pressure_level": 2}):
+            report = self.run_ready(sampler=SimpleNamespace(sample=lambda c=changes: good_sample(**c)))
+            self.assertEqual(report.verdict, "BLOCKED", changes)
+            self.assertEqual(self.status(report, "machine state"), "FAIL", changes)
+
+    def test_battery_power_is_only_a_warning_unless_the_run_is_final(self):
+        battery = SimpleNamespace(sample=lambda: good_sample(power_source="battery", battery_percent=60))
+        report = self.run_ready(sampler=battery)
+        self.assertEqual(report.verdict, "READY")
+        self.assertEqual(self.status(report, "power"), "WARN")
+        final = self.run_ready(ready_args(final=True), sampler=battery)
+        self.assertEqual(final.verdict, "BLOCKED")
+
+    def test_prompt_sizes_off_target_warn_then_fail(self):
+        close = [{"size": "1k", "target": 1000, "first": 1050, "later": 1000}]
+        far = [{"size": "1k", "target": 1000, "first": 1200, "later": 1000}]
+        self.assertEqual(self.status(self.run_ready(sizes=close), "prompt size 1k"), "WARN")
+        report = self.run_ready(sizes=far)
+        self.assertEqual(self.status(report, "prompt size 1k"), "FAIL")
+        self.assertEqual(report.verdict, "BLOCKED")
+
+    def test_a_smoke_run_is_flagged_as_not_a_speed_measurement(self):
+        report = self.run_ready(ready_args(rounds=1))
+        self.assertEqual(self.status(report, "cache warming"), "WARN")
+        self.assertIn("not a speed measurement", next(c.detail for c in report.checks if c.name == "cache warming"))
+        self.assertEqual(report.verdict, "READY")          # a warning, not a block
+        three = self.run_ready(ready_args(rounds=3))
+        self.assertEqual(self.status(three, "cache warming"), "INFO")
+
+    def test_low_free_memory_warns_without_blocking(self):
+        report = self.run_ready(free_gb=1.5)
+        self.assertEqual(self.status(report, "free memory"), "WARN")
+        self.assertEqual(report.verdict, "READY")
+
+    def test_shell_variables_that_would_change_the_baseline_are_flagged(self):
+        report = self.run_ready(environ={"FLASHNEXT_EXPERT_POOL_GB": "0", "PATH": "x"})
+        self.assertEqual(self.status(report, "environment"), "WARN")
+        self.assertIn("FLASHNEXT_EXPERT_POOL_GB", next(c.detail for c in report.checks if c.name == "environment"))
+        flags = {name: "1" for name in ALL_FLAG_NAMES}          # these are cleared per arm, so not a leak
+        self.assertEqual(self.status(self.run_ready(environ=flags), "environment"), "PASS")
+
+    def test_a_checkpoint_the_child_would_not_resolve_is_a_failure(self):
+        with mock.patch("macqwen.checkpoints.resolve_flashnext", side_effect=ValueError("choose a checkpoint\nx")):
+            report = B.check_ready(
+                ready_args(), sampler=SimpleNamespace(sample=lambda: good_sample()),
+                preflight_module=ready_preflight(), tokenizer_loader=lambda p: CharTokenizer(),
+                contract=lambda: [], environ={}, free_gb=8.0)
+        self.assertEqual(self.status(report, "child resolution"), "FAIL")
+
+    def test_prompt_sizes_are_computed_from_the_real_conversation_framing(self):
+        source = "".join(chr(97 + i % 26) for i in range(30000))
+        rows = B.prompt_sizes(CharTokenizer(), ["1k"], source)
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["target"], 1024)
+        self.assertGreater(rows[0]["first"], 1024 - 100)
+        self.assertGreater(rows[0]["later"], 1024 - 100)
+
+    def test_the_overhead_constants_are_the_ones_measured_with_the_real_tokenizer(self):
+        # measured 2026-11-07 with the checkpoint's tokenizer: turn 1 prefills 1025/2049/4097 and
+        # turn 2 1024/2048/4096 tokens for targets 1024/2048/4096
+        self.assertEqual((H.TEMPLATE_OVERHEAD_FIRST, H.TEMPLATE_OVERHEAD_LATER), (36, 23))
+
+    def test_the_real_backend_still_offers_what_the_harness_calls(self):
+        self.assertEqual(B.backend_contract(), [])
+
+    def test_the_contract_check_notices_a_removed_parameter(self):
+        from macqwen.backends.flashnext import FlashNextBackend
+
+        def generate(self, max_tokens, on_decode_token=None):
+            return None
+
+        with mock.patch.object(FlashNextBackend, "generate", generate):
+            problems = B.backend_contract()
+        self.assertTrue(any("on_prefilled" in p for p in problems), problems)
+
+    def test_check_ready_starts_nothing_and_writes_nothing(self):
+        boom = mock.Mock(side_effect=AssertionError("a child was started"))
+        report = SimpleNamespace(verdict="READY", text=lambda: "report text")
+        out = io.StringIO()
+        with mock.patch.object(B.subprocess, "Popen", boom), mock.patch.object(B, "child_main", boom), \
+                mock.patch.object(B, "orchestrate", boom), mock.patch.object(B, "check_ready", return_value=report), \
+                contextlib.redirect_stdout(out):
+            status = B.main(["--check-ready", "--sizes", "1k", "--conditions", "F0", "F2", "--rounds", "1"])
+        self.assertEqual(status, 0)
+        boom.assert_not_called()
+        self.assertIn("report text", out.getvalue())
+
+    def test_check_ready_exit_status_follows_the_verdict(self):
+        report = SimpleNamespace(verdict="BLOCKED", text=lambda: "blocked")
+        with mock.patch.object(B, "check_ready", return_value=report), contextlib.redirect_stdout(io.StringIO()):
+            self.assertEqual(B.main(["--check-ready"]), 1)
+
+    def test_the_checkpoint_option_reaches_the_children_through_the_environment(self):
+        report = SimpleNamespace(verdict="READY", text=lambda: "")
+        with mock.patch.dict(os.environ, {}, clear=False), mock.patch.object(B, "check_ready", return_value=report), \
+                contextlib.redirect_stdout(io.StringIO()):
+            os.environ.pop("MACQWEN_FLASHNEXT_MODEL", None)
+            B.main(["--check-ready", "--checkpoint", "/models/ckpt"])
+            self.assertEqual(os.environ["MACQWEN_FLASHNEXT_MODEL"], "/models/ckpt")
+            os.environ.pop("MACQWEN_FLASHNEXT_MODEL", None)
 
 
 class PolicyTests(unittest.TestCase):

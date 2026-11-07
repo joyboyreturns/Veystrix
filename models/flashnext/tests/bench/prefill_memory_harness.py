@@ -23,14 +23,21 @@ SIZES = {"1k": 1024, "2k": 2048, "4k": 4096}
 DECODE_TOKENS = 128
 RING_EXPERTS = 512
 FOLLOW_UP_OFFSET = 20000
-TEMPLATE_OVERHEAD_FIRST = 64      # system turn and markers around the first user text
-TEMPLATE_OVERHEAD_LATER = 16      # markers around a later user text
+TEMPLATE_OVERHEAD_FIRST = 36      # preface, system turn and markers around the first user text (measured with the real tokenizer)
+TEMPLATE_OVERHEAD_LATER = 23      # preface and markers around a later user text (measured)
 METAL_LIMIT_BYTES = 12_713_115_648   # recorded on this machine; the child reads the live value
 HEADROOM_BYTES = 500_000_000      # G3
 NEXT_SIZE_HEADROOM_BYTES = 2_000_000_000
 CLEANUP_TOLERANCE_BYTES = 250_000_000   # G4
 MIN_ROUNDS_FOR_EFFECT = 3
 TIME_LIMIT_SECONDS = {"1k": 600, "2k": 1200, "4k": 2400}
+
+CACHE_WARNING = (
+    "The first arm of a group reads the checkpoint cold from SSD and later arms find part of it in the page "
+    "cache, so order alone changes the timing (a page-cache effect once inflated a smoke ratio to 1.55x). "
+    "With fewer than 3 rounds in reversed order this is not a speed measurement: do not read an F0 versus "
+    "F2 speed ratio from it. Free memory and page-in counters are recorded per arm to show the cache state."
+)
 
 SYSTEM_TEXT = "You are a careful assistant. Answer briefly."
 FIRST_PREFACE = "Summarize the following text in one sentence.\n\n"

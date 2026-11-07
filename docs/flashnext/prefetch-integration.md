@@ -831,6 +831,18 @@ order, and only if every earlier arm stayed within the gates (14.7).
   Section 12 showed a large order effect for strict alternation on this
   machine, so each (size, turn) group is also reported per round, and an
   effect that flips sign with the order is called unresolved.
+* **Cold-cache imbalance (read this before comparing F0 with F2).** The page
+  cache carries over between processes. The first arm of a group reads the
+  checkpoint cold from SSD, and the arms after it find part of it cached, so
+  order alone changes the timing: a page-cache effect inflated an earlier smoke
+  ratio to 1.55x. A one-round F0 versus F2 run therefore **cannot** show a
+  speedup, whichever way the numbers fall. Only 3 or more rounds in reversed
+  order, judged against the resolution band, can. The harness enforces the
+  wording: `--check-ready` warns when rounds are fewer than 3, a short run
+  prints the same note, and its record carries `speed_evidence: false` and the
+  warning text. Free memory and page-in counters are recorded per arm so the
+  cache state can be compared. An effect that changes sign with the order is
+  cache warming, not the optimisation.
 * A fixed pause lets the machine settle between arms; arms do not run in
   parallel.
 * Power state is recorded before and after every arm (14.5). Final numbers
@@ -930,3 +942,9 @@ resolution-band logic; the orchestrator lifecycle records, preliminary marking,
 size and guard gates, and that `--dry-run` starts no child and writes nothing.
 These are in `models/flashnext/tests/unit/test_bench_prefill_memory.py`.
 The fakes prove the harness logic, not that the real model behaves.
+
+The checkpoint preflight, the harness readiness mode (`--check-ready`), the exact launch command and the first
+real-model smoke test (F0 versus F2, 1K, one round) are in `docs/flashnext/real-checkpoint-smoke-test.md`.
+The real tokenizer put the first-turn prompts at 1,025, 2,049 and 4,097 tokens and the second-turn prompts at
+1,024, 2,048 and 4,096 for targets of 1K, 2K and 4K, after the harness's template-overhead constants were
+corrected from 64 and 16 to 36 and 23.

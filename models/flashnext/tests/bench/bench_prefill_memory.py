@@ -370,6 +370,171 @@ def child_main(args) -> int:
     return 0
 
 
+# -- readiness check (no model, no child, no inference) ---------------------------
+
+def backend_contract() -> list[str]:
+    """Problems with the production API this harness calls (empty = compatible).
+
+    The child wraps ``prefill.prefill_target`` and ``prefill_ring.acquire/release``,
+    reads ``Stats`` and the expert pool's counters, and drives the backend through
+    ``open_conversation``, ``append_user`` and ``generate``. A rename in any of them
+    would break a real run after the model had already loaded, so check them first.
+    """
+    import inspect
+
+    from macqwen.backends.flashnext import FlashNextBackend, Stats
+    from models.flashnext import expert_pool, prefill, prefill_ring
+
+    problems = []
+
+    def need(owner, name, kind, label):
+        if not hasattr(owner, name):
+            problems.append(f"{label} is missing")
+        elif kind == "callable" and not callable(getattr(owner, name)):
+            problems.append(f"{label} is not callable")
+
+    def params(function, names, label):
+        have = set(inspect.signature(function).parameters)
+        problems.extend(f"{label} lacks parameter {n}" for n in names if n not in have)
+
+    params(FlashNextBackend.__init__, ("model_path", "resident_experts"), "FlashNextBackend()")
+    params(FlashNextBackend.generate, ("max_tokens", "on_prefilled", "on_decode_token"),
+           "FlashNextBackend.generate")
+    params(FlashNextBackend.open_conversation, ("system", "user", "enable_thinking"),
+           "FlashNextBackend.open_conversation")
+    params(FlashNextBackend.append_user, ("text", "enable_thinking"), "FlashNextBackend.append_user")
+    from macqwen.conversation import Conversation
+
+    source = inspect.getsource(FlashNextBackend) + inspect.getsource(Conversation)
+    problems.extend(f"backend does not set self.{n}" for n in ("tape", "pending", "cache")
+                    if f"self.{n}" not in source)
+    stats_fields = set(Stats.__dataclass_fields__)
+    problems.extend(f"Stats lacks {n}" for n in ("tokens", "prefill_seconds", "finish", "prompt_tokens")
+                    if n not in stats_fields)
+    need(Stats, "rate", "any", "Stats.rate")
+    for name in ("prefill_target",):
+        need(prefill, name, "callable", f"prefill.{name}")
+    for name in ("acquire", "release", "metal_working_set_limit"):
+        need(prefill_ring, name, "callable", f"prefill_ring.{name}")
+    for name in ("LAST_REASON", "_RETAINED", "FLAG_EXPERTS", "FLAG_SCRATCH"):
+        need(prefill_ring, name, "any", f"prefill_ring.{name}")
+    pool_source = inspect.getsource(expert_pool.ExpertPool)
+    for name in ("slots", "hits", "misses", "_slot_of"):
+        if f"self.{name}" not in pool_source:
+            problems.append(f"ExpertPool does not set self.{name}")
+    return problems
+
+
+def prompt_sizes(tokenizer, sizes: list[str], source: str) -> list[dict]:
+    """Real first-turn and second-turn token counts per size, from the tokenizer alone."""
+    from macqwen.conversation import Conversation
+
+    rows = []
+    for size in sizes:
+        target = H.SIZES[size]
+        prompts = H.build_prompts(tokenizer, source, target)
+        conversation = Conversation(tokenizer)
+        first = conversation.open_conversation(prompts["system"], prompts["first"], enable_thinking=False)
+        conversation.tape.extend(conversation.pending)
+        conversation.pending = []
+        conversation.tape.extend(tokenizer.encode("A short reply."))
+        later = conversation.append_user(prompts["later"], enable_thinking=False)
+        rows.append({"size": size, "target": target, "first": int(first), "later": int(later)})
+    return rows
+
+
+def check_ready(args, *, sampler=None, preflight_module=None, tokenizer_loader=None,
+                contract=backend_contract, environ=None, free_gb=None):
+    """Everything the F0-versus-F2 smoke test needs, checked without starting it.
+
+    Returns a ``preflight.Report`` whose verdict is READY or BLOCKED. Nothing here loads
+    the model, starts a child process or runs inference.
+    """
+    from models.flashnext import preflight as pf
+
+    preflight_module = preflight_module or pf
+    environ = os.environ if environ is None else environ
+    path = pf.resolve_target(getattr(args, "checkpoint", None))
+    report = pf.Report(path)
+    inner = preflight_module.check_checkpoint(path)
+    report.add("checkpoint preflight", {pf.READY: pf.PASS}.get(inner.verdict, pf.FAIL),
+               f"{inner.verdict} ({len(inner.by_status(pf.FAIL))} failing, {len(inner.by_status(pf.WARN))} warning checks)"
+               + ("" if inner.verdict == pf.READY else "; run: python -m models.flashnext.preflight"))
+    # the child resolves the checkpoint exactly like this
+    try:
+        from macqwen.checkpoints import resolve_flashnext
+
+        resolved = str(resolve_flashnext(getattr(args, "checkpoint", None)
+                                         or environ.get("MACQWEN_FLASHNEXT_MODEL") or None))
+        report.add("child resolution", pf.PASS if Path(resolved) == Path(path).resolve() else pf.WARN,
+                   f"resolve_flashnext -> {resolved}")
+    except (ValueError, SystemExit) as error:
+        report.add("child resolution", pf.FAIL, str(error).splitlines()[0])
+    problems = contract()
+    report.add("backend API", pf.FAIL if problems else pf.PASS,
+               "; ".join(problems) if problems else "the calls the harness makes still exist")
+    if inner.verdict == pf.READY or tokenizer_loader is not None:
+        try:
+            tokenizer = (tokenizer_loader or _load_tokenizer)(path)
+            rows = prompt_sizes(tokenizer, args.sizes, SOURCE_TEXT.read_text())
+            for row in rows:
+                off = max(abs(row["first"] - row["target"]), abs(row["later"] - row["target"])) / row["target"]
+                report.add(f"prompt size {row['size']}", pf.PASS if off <= 0.03 else (pf.WARN if off <= 0.10 else pf.FAIL),
+                           f"turn 1 prefills {row['first']} tokens, turn 2 {row['later']} (target {row['target']}, off by {off:.1%})",
+                           **row)
+        except Exception as error:      # a tokenizer problem must be reported, not crash the check
+            report.add("prompt sizes", pf.FAIL, f"{type(error).__name__}: {error}")
+    else:
+        report.add("prompt sizes", pf.SKIP, "needs a READY checkpoint (tokenizer files)")
+    sampler = sampler or H.Sampler(vm=_vm_counters, load=lambda: os.getloadavg()[0])
+    sample = sampler.sample()
+    reason = H.Watchdog(H.SafetyPolicy(final=bool(getattr(args, "final", False))), sample).check(sample)
+    report.add("machine state", pf.FAIL if reason else pf.PASS,
+               reason or f"battery {sample.get('battery_percent')}% on {sample.get('power_source')}, "
+                         f"Low Power Mode {sample.get('low_power')}, pressure level {sample.get('pressure_level')}, "
+                         f"swap used {sample.get('swap_used_mb')} MB")
+    if sample.get("power_source") != "ac":
+        report.add("power", pf.WARN, "on battery: every record will be marked preliminary; "
+                   "final numbers need AC power and Low Power Mode off (--final enforces it)")
+    free = free_gb if free_gb is not None else _free_memory_gb()
+    if free is not None:
+        report.add("free memory", pf.WARN if free < 3.0 else pf.PASS,
+                   f"{free:.1f} GB free or inactive" + ("; close browsers and other apps before a real run" if free < 3.0 else ""))
+    leaked = {k: v for k, v in environ.items() if k.startswith("FLASHNEXT_") and k not in H.production_flags().values()}
+    report.add("environment", pf.WARN if leaked else pf.PASS,
+               f"set in this shell, overriding the production chat defaults: {sorted(leaked)}" if leaked
+               else "no FLASHNEXT_* variables set in this shell (the baseline is the production chat environment)")
+    arms = H.build_schedule(args.sizes, args.conditions, args.rounds)
+    speed_ok = args.rounds >= H.MIN_ROUNDS_FOR_EFFECT
+    report.add("cache warming", pf.INFO if speed_ok else pf.WARN,
+               ("3 or more reversed rounds: speed effects can be judged against the resolution band, "
+                "with the cache state recorded per arm" if speed_ok else H.CACHE_WARNING))
+    report.add("schedule", pf.PASS, f"{len(arms)} fresh-process arms: " + ", ".join(a.arm_id for a in arms[:8])
+               + (" ..." if len(arms) > 8 else ""))
+    report.verdict = "READY" if not report.by_status(pf.FAIL) else "BLOCKED"
+    return report
+
+
+def _load_tokenizer(path):
+    from macqwen.backends.flashnext import _load_transformers_tokenizer
+
+    return _load_transformers_tokenizer().from_pretrained(path)
+
+
+def _free_memory_gb():
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+        page = int(out.split("page size of")[1].split("bytes")[0])
+        pages = {}
+        for line in out.splitlines():
+            label, _, value = line.partition(":")
+            if label.strip() in ("Pages free", "Pages inactive", "Pages speculative"):
+                pages[label.strip()] = int(value.strip().rstrip("."))
+        return sum(pages.values()) * page / 1e9
+    except Exception:
+        return None
+
+
 # -- orchestrator -------------------------------------------------------------
 
 def child_command(arm: H.Arm, decode: int, result: Path) -> list[str]:
@@ -435,8 +600,12 @@ def orchestrate(args, sampler=None, popen=subprocess.Popen, sleep=time.sleep) ->
         "rounds": args.rounds, "decode_tokens": args.decode,
         "schedule": [a.arm_id for a in arms], "sources": fingerprints(),
         "sampler": "greedy; closed thinking block",
+        "speed_evidence": args.rounds >= H.MIN_ROUNDS_FOR_EFFECT,
+        "cache_warning": None if args.rounds >= H.MIN_ROUNDS_FOR_EFFECT else H.CACHE_WARNING,
     })
     run.start()
+    if args.rounds < H.MIN_ROUNDS_FOR_EFFECT:
+        print("NOTE:", H.CACHE_WARNING, flush=True)
     if refusal:
         run.failure(refusal, error_type="safety_stop", phase="preflight")
         run.finish("stopped", reason=refusal)
@@ -552,6 +721,11 @@ def main(argv=None) -> int:
     parser.add_argument("--settle", type=float, default=30.0, help="pause between arms")
     parser.add_argument("--final", action="store_true",
                         help="require AC power; otherwise records are marked preliminary")
+    parser.add_argument("--checkpoint", help="checkpoint directory or alias; sets MACQWEN_FLASHNEXT_MODEL "
+                        "for the children (default: $MACQWEN_FLASHNEXT_MODEL, else the single checkpoint in ~/models)")
+    parser.add_argument("--check-ready", action="store_true",
+                        help="check the checkpoint, backend API, prompt sizes and machine state; "
+                             "starts nothing and writes nothing")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the schedule and flags; start nothing, write nothing")
     parser.add_argument("--record", help="measurement JSONL path (inside results/)")
@@ -568,6 +742,12 @@ def main(argv=None) -> int:
             parser.error("--child needs --size and --condition")
         args.round -= 1
         return child_main(args)
+    if args.checkpoint:
+        os.environ["MACQWEN_FLASHNEXT_MODEL"] = args.checkpoint
+    if args.check_ready:
+        report = check_ready(args)
+        print(report.text())
+        return 0 if report.verdict == "READY" else 1
     if args.dry_run:
         arms = H.build_schedule(args.sizes, args.conditions, args.rounds)
         print(f"{len(arms)} fresh-process arms; sizes {args.sizes}; rounds {args.rounds}")
