@@ -746,3 +746,187 @@ All of this needs approval and a plugged-in, Low Power Mode off run.
 4. That decode after a scratch prefill reaches the same hit rate and speed as
    today, since the decode pool starts cold in both cases.
 
+
+## 14. End-to-end validation plan (real checkpoint, not yet run)
+
+Nothing in this section has been measured. It is the plan the harness in
+`models/flashnext/tests/bench/bench_prefill_memory.py` implements. The harness
+has been tested offline with fakes only (14.9). Every number tagged
+**[estimate]** is arithmetic from sections 12 and 13, not a result.
+
+### 14.1 Questions and non-goals
+
+1. Does the scratch pool (`FLASHNEXT_PREFILL_RING_SCRATCH=1`) keep a first-turn
+   prefill under the 12.713 GB Metal limit, and how much does it cost?
+2. Does the in-pool ring on a later turn (pool warm) help, and does the cache
+   cap (`FLASHNEXT_PREFILL_CACHE_LIMIT_MB`) change speed or footprint?
+3. Is every output exactly what the baseline produces?
+4. Does decode after a scratch prefill match decode after a baseline prefill?
+
+Non-goals: no change to Q4 weights, routing, sampler or prompts; no checkpoint
+download; no production-default change; no speed claim before the paired
+comparison clears its resolution band.
+
+### 14.2 Conditions
+
+All conditions start from the production chat environment (`CHAT_ENV`,
+`FLASHNEXT_EXPERT_POOL_GB=6`) and overlay only the opt-in flags below.
+`ring=512` means `FLASHNEXT_PREFILL_RING_EXPERTS=512`, one half holding every
+expert of a layer, so no layer falls back for capacity.
+
+| Id | Turn | Ring | Scratch | Cache cap | Purpose |
+|---|---|---|---|---|---|
+| F0 | first | off | n/a | off | baseline; no pool exists during prefill |
+| F1 | first | 512 | off | off | ring in a freshly created 6 GB pool; 1K only, last, memory-guarded |
+| F2 | first | 512 | on | off | scratch pool |
+| F3a / F3b | first | 512 | on | 512 / 1024 MB | scratch pool plus cache cap |
+| F4 | first | off | n/a | 512 MB | cache cap alone |
+| S0 | second | off | n/a | off | baseline; pool warm |
+| S1 | second | 512 | n/a (pool exists) | off | in-pool ring |
+| S2 | second | 512 | n/a | 512 MB | in-pool ring plus cache cap |
+
+F1 is the only condition that creates the 6 GB pool during prefill. Its
+**[estimate]** is 11.1 GB against 12.713 GB, so it runs at 1K only, last in the
+order, and only if every earlier arm stayed within the gates (14.7).
+
+### 14.3 Sizes, prompts and what each turn prefills
+
+* Sizes: 1K, 2K and 4K prompt tokens. 4K runs only if the 2K arms left at least
+  2 GB of headroom under the Metal limit (14.8).
+* The prompt is built from a fixed source (`docs/flashnext/research.md`) by a
+  fixed token slice. The first-turn user message is tokens `[0, N)`, the
+  second-turn message is tokens `[20000, 20000 + N)`. The harness records the
+  source hash, the prompt-text hash, the token-id hash and the actual token
+  count. Tokenisation is the backend's own.
+* The first-turn arm opens the conversation with `open_conversation` and
+  prefills the whole prompt.
+* The second-turn arm runs turn 1 first (same prompt, decode 128 tokens), then
+  `append_user`. `generate` prefills **only the pending tokens** because the KV
+  cache is reused, so the harness records the number of tokens actually
+  prefilled (a wrapper on `prefill_target` records `ids.shape[1]`), never the
+  nominal prompt size. Prefill tok/s uses the recorded number.
+* Turn 1 of a second-turn arm is setup and always runs under the baseline flags
+  (the child launches with every opt-in flag unset and applies the condition's
+  flags only after turn 1, which works because the flags are read at call
+  time). The setup is therefore identical in every second-turn arm, and the
+  condition affects turn 2 alone.
+* Turn-1 work (which loads experts into the decode pool) is part of the setup
+  of a second-turn arm, so the "resident experts" state differs from a first
+  turn. The harness records pool existence, slots used, hits and misses at the
+  start and end of each turn, so a change in hit rate is visible and is not
+  mistaken for a ring effect.
+* Sampling is greedy, thinking is closed, decode is 128 tokens.
+
+### 14.4 Process and order
+
+* Every arm runs in a fresh child process (`--child`), loads the checkpoint
+  once, runs one scenario, writes one JSON file and exits. No arm inherits an
+  allocator cache, a pool or a page cache warmed by another arm in the same
+  process.
+* The page cache still carries over between processes. The harness records
+  free memory and page-in counters per arm and does not claim that arms start
+  cold. A cold start needs `purge` (sudo) and is out of scope unless approved.
+* At least 3 rounds per condition and size. Even rounds run the conditions in
+  the listed order, odd rounds in reverse (the project standard).
+  Section 12 showed a large order effect for strict alternation on this
+  machine, so each (size, turn) group is also reported per round, and an
+  effect that flips sign with the order is called unresolved.
+* A fixed pause lets the machine settle between arms; arms do not run in
+  parallel.
+* Power state is recorded before and after every arm (14.5). Final numbers
+  need the Mac plugged in with Low Power Mode off; any battery-mode run is
+  labelled preliminary in its records.
+
+### 14.5 What is recorded
+
+| Group | Fields | Source |
+|---|---|---|
+| Environment | battery %, power source, Low Power Mode, thermal level, swap used, memory-pressure level, load average, free memory | `pmset -g batt`, `pmset -g`, `pmset -g therm`, `sysctl vm.swapusage`, `sysctl kern.memorystatus_vm_pressure_level`, `vm_stat` |
+| Provenance | checkpoint path and identity, source hashes of the harness and the production files it exercises, prompt hashes, sampler, order, flags | harness |
+| MLX memory | active, peak and cache memory after load, at the end of prefill, at the end of decode; Metal limit | `mx.get_*_memory` |
+| Process memory | resident footprint after load and after prefill | `ps` / `footprint` when available |
+| Pool | exists before and after prefill; slots; hits and misses | store and `ExpertPool` |
+| Scratch | acquire time, dispose time, page faults during acquire, ring statistics, `LAST_REASON` | wrappers on `acquire` and `release` |
+| Prefill | prefilled tokens, seconds, tok/s | `Stats` and wrapper |
+| Generation | tok/s over decode tokens 1 to 64 and 65 to 128 | token timestamps |
+| SSD | physical bytes read during prefill and during decode | `proc_pid_rusage` |
+| VM | compressions, decompressions, page-ins, page-outs, swap-ins and swap-outs, as deltas | `vm_stat` |
+| Exactness | first token, hash of the KV cache after prefill, 128-token greedy digest | harness |
+
+The KV-cache hash is computed after the end-of-prefill memory reading and is
+excluded from the timers. If a cache entry cannot be hashed the field says so,
+and the greedy digest carries the exactness gate alone.
+
+### 14.6 Exactness
+
+For one (size, turn), every condition must give the same first token, the same
+cache hash and the same 128-token digest as the baseline. A different value
+stops that group and marks every condition in it invalid for speed. A pass says
+the outputs match on these prompts; it does not prove equality on others.
+
+### 14.7 Gates
+
+| Gate | Passes when |
+|---|---|
+| G1 exactness | all digests in a group equal the baseline's |
+| G2 ring health | in ring conditions the ring was acquired, with zero fallbacks of any kind and no error; otherwise the arm is invalid for speed, not a failure of the feature |
+| G3 memory | MLX peak plus the largest allocator-cache reading taken (MLX has no peak-cache counter) stays at least 0.5 GB under the Metal limit; F1 additionally runs only if every earlier arm passed its gates |
+| G4 scratch cleanup | at the end of prefill in scratch conditions the decode pool does not yet exist, nothing is retained, and active memory is within 0.25 GB of the baseline's end-of-prefill active memory |
+| G5 no regression | decode tok/s and the first decode window are not slower than the baseline by more than the resolution band, and swap and page-out deltas are not larger |
+
+A speed effect is reported only as a paired difference (condition minus the
+baseline of the same round) with its resolution band, taken as the spread of
+the baseline arms. An effect inside the band is reported as unresolved.
+
+### 14.8 Automatic stops
+
+The orchestrator samples the machine every 5 seconds while a child runs, and
+before each arm. It kills the child and stops the run, preserving the partial
+record, when any of these holds:
+
+* battery below 25% while on battery;
+* Low Power Mode on (always), or, in a `--final` run, not on AC power or an
+  unreadable Low Power Mode state (a run on battery without `--final` is
+  allowed and every record is marked preliminary);
+* any swap-in or swap-out delta above zero, or swap used grew by more than
+  64 MB since the run began;
+* kernel memory-pressure level 2 (warning) or 4 (critical);
+* thermal throttling (a CPU speed limit below 100) in two samples in a row;
+* the child exits with status 137 or a kill signal (treated as a memory kill
+  and recorded as such);
+* a child exceeding its time limit (**[estimate]** 1K takes about 50 s of
+  prefill per the 49.3 s record; limits are 10, 20 and 40 minutes for 1K, 2K
+  and 4K including load and decode).
+
+The orchestrator also stops before the next size if the previous size's worst
+headroom was under 2 GB.
+
+### 14.9 Cost and order of work
+
+**[estimate]** Prefill scaled from the 49.3 s record for 1,007 tokens gives
+about 1.7 minutes at 2K and 3.5 minutes at 4K if it scales linearly, plus load
+and 128 decode tokens. A full matrix is therefore tens of fresh processes and
+roughly two to four hours. Those figures are estimates, not measurements.
+
+1. Preflight: power, battery, Low Power Mode, thermal, swap, free memory, and
+   the harness `--dry-run` (prints the schedule and the commands, touches
+   nothing).
+2. Smoke: F0 and F2 at about 1K, one round each, to check the harness and the
+   gates.
+3. Full 1K: all first-turn and second-turn conditions, 3 rounds.
+4. 2K, then 4K only if the previous size left at least 2 GB of headroom.
+
+Offline checks of the harness itself (no model, no checkpoint, no GPU
+benchmark; fakes for the backend, the clock, the child process and the macOS
+commands): the condition table against the production flag constants and the
+way production reads each condition; baseline equal to the production chat
+environment; schedule order, reversal, guarded-last and size rules; prompt
+reproducibility; the power, thermal, swap and pressure parsers; every stop rule;
+child kill (including a child that ignores terminate), time limit and exit-137
+handling; a child scenario on a fake backend (second-turn flags applied to
+turn 2 only, the prefilled-token count under KV reuse, wrappers that restore
+the originals, scratch pool left behind detected); exactness, gate and
+resolution-band logic; the orchestrator lifecycle records, preliminary marking,
+size and guard gates, and that `--dry-run` starts no child and writes nothing.
+These are in `models/flashnext/tests/unit/test_bench_prefill_memory.py`.
+The fakes prove the harness logic, not that the real model behaves.
