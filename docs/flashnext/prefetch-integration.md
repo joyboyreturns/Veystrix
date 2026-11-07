@@ -621,3 +621,128 @@ established.
   that had no pool in it, so the real-model headroom is only about 0.6 GB
   without the ring. The synthetic headroom of 4.5 GB or more in 12.4 is for
   MoE layers alone and must not be read as the real figure.
+
+## 13. Memory footprint during prefill: feasibility and the first-turn scratch pool (2026-11-07)
+
+Tags used below: **[measured]** on this machine in this work; **[recorded]**
+from an earlier recorded run of the real model; **[code]** read from the
+source; **[estimate]** derived arithmetic, not a measurement; **[not measured]**
+a gap. Nothing in this section is a measured result on the real checkpoint.
+
+### 13.1 What is known
+
+* **[measured]** MLX counts a wrapped pool at its full size in
+  `get_active_memory` and `get_peak_memory`: creating a 6 GB pool raised active
+  memory by exactly 6.000 GB, touched or not.
+* **[measured]** Device limits (MLX 0.32.2): recommended working set 12.713 GB,
+  maximum buffer 9.535 GB. MLX's default cache limit and memory limit are both
+  16.32 GB, so the allocator cache is effectively unbounded.
+* **[measured]** MLX enforces a lowered cache limit lazily, at the next
+  allocation: after lowering it, 128 MB stayed cached until the next allocation
+  trimmed it to 4 MB.
+* **[measured]** Synthetic MoE-only runs (12.4), peak including the pool:
+  7.22, 7.61 and 8.18 GB without the ring and 6.19, 6.38 and 6.76 GB with it at
+  1K, 2K and 4K tokens.
+* **[code]** The decode pool is created lazily by `StreamingSwitchGLU._pool_pass`
+  (first decode). The only other creation site was `prefill_ring.acquire`. So a
+  first-turn prefill carries no pool today.
+* **[recorded]** A 1,007-token real prefill peaked at 6.145 GB of MLX memory,
+  with no pool in it: dense core 3.43 GB, per-layer expert buffers about 1.03
+  GB, other transients about 1.7 GB (the last is derived).
+* **[recorded]** (`expert_pool.py` docstring, from the 2026-09-23 read replay)
+  A 5 GB pool tied the production path, a 6 GB pool read 15 to 24 ms/token
+  faster, 3 and 4 GB lost.
+* **[estimate]** With the ring inside a freshly created 6 GB pool, a first-turn
+  prefill would be about 3.4 + 1.7 + 6.0 = 11.1 GB against the 12.713 GB limit.
+  Today's later turns are about 12.1 GB (section 5) and 11.1 GB with the ring.
+* **[not measured]** Real-model peak, allocator cache size and free memory with
+  any of these changes, and the effect of a small cache cap on speed.
+
+### 13.2 Options considered
+
+| Option | Saves | Risk | Decision |
+|---|---|---|---|
+| A. Cap MLX's allocator cache during prefill and count the cache in the guard | **[not measured]** | Very low; values unchanged; cost is more allocations | Implemented, opt-in |
+| B. Temporary right-sized pool for first-turn prefill | **[estimate]** first-turn peak about 6.7 GB (3.4 + 1.7 + 1.6) instead of 11.1 GB | Low to moderate; reuses `ExpertPool`; free-while-in-use class of risk | Implemented, opt-in |
+| C. Resize the decode pool | n/a | MLX wraps a fixed buffer and counts all of it; resizing destroys the hot experts that gave the decode gain (13.1, replay) | Not done |
+| D. Run the MoE in token chunks over staged weights | **[estimate]** at most 0.6 GB at 4K (the ring arm's working memory above the pool was 0.19, 0.38 and 0.76 GB, **[measured]**) | Needs a bitwise-exactness test; kernel choice may change with row count | Not done |
+| E. Skip full-sequence logits for short prompts | n/a | `prefill.py` records that last-row-only projection changed logits by up to 0.125 | Never; exactness |
+
+### 13.3 What is implemented (all opt-in, default off)
+
+Settings (research, startup): `FLASHNEXT_PREFILL_RING_SCRATCH` (`0`/`1`,
+default `0`) and `FLASHNEXT_PREFILL_CACHE_LIMIT_MB` (default `0`). The scratch
+option applies only with the ring on (`FLASHNEXT_PREFILL_RING_EXPERTS` above 0)
+and the expert pool enabled (`FLASHNEXT_EXPERT_POOL_GB` above 0); without the
+pool the ring is not acquired at all. With all of them unset, `prefill_target`
+calls the original function unchanged, and `expert_cache.py` and `pool_ring.py`
+are not touched by this change.
+
+| Situation | Where the ring lives | Pool created or freed during prefill |
+|---|---|---|
+| Ring off | no ring | none, as before |
+| Ring on, scratch off, first turn | in a pool the ring creates | creates the full decode pool (the first-turn growth of 13.1); now refused up front if it would not fit |
+| Ring on, scratch on, first turn | private pool of the half plus 16 slots (about 1.62 GB at 512 experts, 1.08 GB at 334) | created for the prefill, freed at its end; the decode pool is created at first decode as before |
+| Ring on, later turns | in the decode pool | none |
+
+**Option B, release order.** Stop routing layers to the ring; fence the GPU
+(`finish` or `abort`); close the ring (waits for any writer); fence again;
+drop every reference (file descriptors, the MLX buffer, the numpy and memory
+views); collect garbage and clear MLX's cache. The temporary pool is never
+registered with the store, so the decode pool is created fresh and is never
+mixed with it. If the ring does not close in time, the temporary pool is
+**kept alive** (`_RETAINED`) instead of freed under a possible writer or GPU
+job. A pool that cannot be created, or a ring that cannot be leased, frees
+what it made.
+
+**Option A.** `prefill_memory.cache_cap` sets the cache limit for the call,
+trims an oversized cache on entry (because MLX would only trim at the next
+allocation), and restores the previous limit on every exit path, including
+`KeyboardInterrupt`. It nests outside the ring.
+
+**Accounting, one count each.** MLX's active memory already contains every
+wrapped pool; the allocator cache is a separate counter and is added; a pool
+that does not exist yet is added once, before it is created. A request that
+would not fit is refused before anything is allocated. The per-layer guard
+adds the cache too.
+
+### 13.4 Tests (offline; synthetic checkpoint; no GPU benchmark)
+
+First turn (private pool, never creates the decode pool, bitwise equal to the
+existing path); the temporary pool's memory is returned before the decode pool
+is created (active memory returns to its baseline, then grows by exactly the
+decode pool); later turns use the decode pool; two first-turn prefills in a row;
+flag off keeps the earlier behaviour; strict flag parsing; `pool_length` matches
+a real pool; refusal before allocation (exact one-byte boundary, `ExpertPool`
+and `for_store` never called); cache and pool each counted once at acquire and
+per layer; pressure during a prefill; cleanup after an exception and after
+`KeyboardInterrupt`; releasing twice; a ring that will not close keeps its pool;
+a release with GPU work in flight (`mx.async_eval`) never loses data; the fence
+order before the free for normal and failed ends; cache cap set, restored,
+restored after exceptions, trimmed on entry, values unchanged; the
+`prefill_target` wiring in every flag combination.
+
+Mutation check: each of six deliberate breakages is caught by at least one test
+(no fence in `dispose`; freeing even when the ring did not close; a guard that
+ignores the cache; an over-counting guard; a no-op `_release_pool`; a `dispose`
+that frees nothing).
+
+Measurement tests that read active memory wait for it to settle first. MLX
+frees arrays asynchronously, and two earlier tests that compared single readings
+were flaky.
+
+### 13.5 Not yet validated on the real checkpoint
+
+All of this needs approval and a plugged-in, Low Power Mode off run.
+
+1. Real peak, allocator cache and free memory for a first turn and a second
+   turn, with scratch off and on, at 1K, 2K and 4K tokens, compared with
+   today's first-turn peak (6.145 GB **[recorded]**).
+2. The time cost of a fresh private pool per prefill (first-touch page faults of
+   up to 1.6 GB) and of a small cache cap. A prompt that is prefilled in several
+   calls gets a private pool for each call.
+3. Exactness: ring-on against ring-off digests on real prompts (the synthetic
+   outputs are bit-identical).
+4. That decode after a scratch prefill reaches the same hit rate and speed as
+   today, since the decode pool starts cold in both cases.
+
