@@ -1,0 +1,602 @@
+[
+ {
+  "model": "router_b1",
+  "units": "coreml-cpu",
+  "batch": 1,
+  "p50_ms": 0.0355839729309082,
+  "p95_ms": 0.03850000211969018,
+  "plan_preferred": {
+   "linear": "CPU"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 73.613312,
+  "load_s": 0.21646704198792577
+ },
+ {
+  "model": "router_b1",
+  "units": "coreml-ane",
+  "batch": 1,
+  "p50_ms": 0.035375007428228855,
+  "p95_ms": 0.037833990063518286,
+  "plan_preferred": {
+   "linear": "CPU"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 74.350592,
+  "load_s": 0.2235066249850206
+ },
+ {
+  "model": "router_b16",
+  "units": "coreml-cpu",
+  "batch": 16,
+  "p50_ms": 0.0718749943189323,
+  "p95_ms": 0.07387500954791903,
+  "plan_preferred": {
+   "linear": "NeuralEngine"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 74.088448,
+  "load_s": 0.21879070904105902
+ },
+ {
+  "model": "router_b16",
+  "units": "coreml-ane",
+  "batch": 16,
+  "p50_ms": 0.17320801271125674,
+  "p95_ms": 0.18333300249651074,
+  "plan_preferred": {
+   "linear": "NeuralEngine"
+  },
+  "neural_MB": 2.719744,
+  "rss_MB": 72.941568,
+  "load_s": 0.24726233398541808
+ },
+ {
+  "model": "router_b256",
+  "units": "coreml-cpu",
+  "batch": 256,
+  "p50_ms": 0.4206669982522726,
+  "p95_ms": 0.4295000107958913,
+  "plan_preferred": {
+   "linear": "NeuralEngine"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 85.180416,
+  "load_s": 0.22724883299088106
+ },
+ {
+  "model": "router_b256",
+  "units": "coreml-ane",
+  "batch": 256,
+  "p50_ms": 0.40912494296208024,
+  "p95_ms": 0.4199169925414026,
+  "plan_preferred": {
+   "linear": "NeuralEngine"
+  },
+  "neural_MB": 2.719744,
+  "rss_MB": 84.328448,
+  "load_s": 0.25509241700638086
+ },
+ {
+  "model": "router_b1024",
+  "units": "coreml-cpu",
+  "batch": 1024,
+  "p50_ms": 1.6057919710874557,
+  "p95_ms": 1.666792028117925,
+  "plan_preferred": {
+   "linear": "NeuralEngine"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 121.061376,
+  "load_s": 0.2395039580296725
+ },
+ {
+  "model": "router_b1024",
+  "units": "coreml-ane",
+  "batch": 1024,
+  "p50_ms": 1.4114170335233212,
+  "p95_ms": 1.5140409814193845,
+  "plan_preferred": {
+   "linear": "NeuralEngine"
+  },
+  "neural_MB": 7.962624,
+  "rss_MB": 119.947264,
+  "load_s": 0.26883920904947445
+ },
+ {
+  "model": "router3_b1",
+  "units": "coreml-cpu",
+  "batch": 1,
+  "p50_ms": 0.042832980398088694,
+  "p95_ms": 0.045290973503142595,
+  "plan_preferred": {
+   "linear": "CPU"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 78.905344,
+  "load_s": 0.2298283749842085
+ },
+ {
+  "model": "router3_b1",
+  "units": "coreml-ane",
+  "batch": 1,
+  "p50_ms": 0.04291703226044774,
+  "p95_ms": 0.04558300133794546,
+  "plan_preferred": {
+   "linear": "CPU"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 79.773696,
+  "load_s": 0.23396487504942343
+ },
+ {
+  "model": "router3_b16",
+  "units": "coreml-cpu",
+  "batch": 16,
+  "p50_ms": 0.12208300177007914,
+  "p95_ms": 0.12770795729011297,
+  "plan_preferred": {
+   "linear": "NeuralEngine"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 79.21664,
+  "load_s": 0.23261891695437953
+ },
+ {
+  "model": "router3_b16",
+  "units": "coreml-ane",
+  "batch": 16,
+  "p50_ms": 0.28000003658235073,
+  "p95_ms": 0.2924579894170165,
+  "plan_preferred": {
+   "linear": "NeuralEngine"
+  },
+  "neural_MB": 7.962624,
+  "rss_MB": 73.007104,
+  "load_s": 0.2600754169980064
+ },
+ {
+  "model": "router3_b256",
+  "units": "coreml-cpu",
+  "batch": 256,
+  "p50_ms": 0.8590000215917826,
+  "p95_ms": 0.8908329764381051,
+  "plan_preferred": {
+   "linear": "NeuralEngine"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 92.65152,
+  "load_s": 0.23861208296148106
+ },
+ {
+  "model": "router3_b256",
+  "units": "coreml-ane",
+  "batch": 256,
+  "p50_ms": 0.6064169574528933,
+  "p95_ms": 0.6185840466059744,
+  "plan_preferred": {
+   "linear": "NeuralEngine"
+  },
+  "neural_MB": 7.962624,
+  "rss_MB": 85.884928,
+  "load_s": 0.2703637079684995
+ },
+ {
+  "model": "router3_b1024",
+  "units": "coreml-cpu",
+  "batch": 1024,
+  "p50_ms": 3.5238339914940298,
+  "p95_ms": 3.6224169889464974,
+  "plan_preferred": {
+   "linear": "NeuralEngine"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 139.280384,
+  "load_s": 0.24839366599917412
+ },
+ {
+  "model": "router3_b1024",
+  "units": "coreml-ane",
+  "batch": 1024,
+  "p50_ms": 2.2232920164242387,
+  "p95_ms": 2.374708012212068,
+  "plan_preferred": {
+   "linear": "NeuralEngine"
+  },
+  "neural_MB": 13.205504,
+  "rss_MB": 130.49856,
+  "load_s": 0.27917104202788323
+ },
+ {
+  "model": "router_topk_b1",
+  "units": "coreml-cpu",
+  "batch": 1,
+  "p50_ms": 0.05974998930469155,
+  "p95_ms": 0.06379198748618364,
+  "plan_preferred": {
+   "linear": "CPU",
+   "topk": "CPU",
+   "cast": "CPU"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 73.89184,
+  "load_s": 0.22470466699451208
+ },
+ {
+  "model": "router_topk_b1",
+  "units": "coreml-ane",
+  "batch": 1,
+  "p50_ms": 0.05904200952500105,
+  "p95_ms": 0.062000006437301636,
+  "plan_preferred": {
+   "linear": "CPU",
+   "topk": "CPU",
+   "cast": "CPU"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 74.743808,
+  "load_s": 0.23714020801708102
+ },
+ {
+  "model": "router_topk_b16",
+  "units": "coreml-cpu",
+  "batch": 16,
+  "p50_ms": 0.09583297651261091,
+  "p95_ms": 0.0997089664451778,
+  "plan_preferred": {
+   "linear": "NeuralEngine",
+   "topk": "NeuralEngine",
+   "cast": "CPU"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 74.1376,
+  "load_s": 0.22505845798878
+ },
+ {
+  "model": "router_topk_b16",
+  "units": "coreml-ane",
+  "batch": 16,
+  "p50_ms": 0.2234579878859222,
+  "p95_ms": 0.23670803057029843,
+  "plan_preferred": {
+   "linear": "NeuralEngine",
+   "topk": "NeuralEngine",
+   "cast": "CPU"
+  },
+  "neural_MB": 2.719744,
+  "rss_MB": 73.48224,
+  "load_s": 0.3966509169549681
+ },
+ {
+  "model": "router_topk_b256",
+  "units": "coreml-cpu",
+  "batch": 256,
+  "p50_ms": 0.5275419680401683,
+  "p95_ms": 0.5590409855358303,
+  "plan_preferred": {
+   "linear": "NeuralEngine",
+   "topk": "NeuralEngine",
+   "cast": "CPU"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 84.656128,
+  "load_s": 0.22701066604349762
+ },
+ {
+  "model": "router_topk_b256",
+  "units": "coreml-ane",
+  "batch": 256,
+  "p50_ms": 1.0918329935520887,
+  "p95_ms": 1.1135420063510537,
+  "plan_preferred": {
+   "linear": "NeuralEngine",
+   "topk": "NeuralEngine",
+   "cast": "CPU"
+  },
+  "neural_MB": 7.176192,
+  "rss_MB": 84.328448,
+  "load_s": 0.5275402499828488
+ },
+ {
+  "model": "router_topk_b1024",
+  "units": "coreml-cpu",
+  "batch": 1024,
+  "p50_ms": 2.5308330077677965,
+  "p95_ms": 2.782708965241909,
+  "plan_preferred": {
+   "linear": "NeuralEngine",
+   "topk": "NeuralEngine",
+   "cast": "CPU"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 116.948992,
+  "load_s": 0.24285400001099333
+ },
+ {
+  "model": "router_topk_b1024",
+  "units": "coreml-ane",
+  "batch": 1024,
+  "p50_ms": 3.0747500131838024,
+  "p95_ms": 3.342459036502987,
+  "plan_preferred": {
+   "linear": "NeuralEngine",
+   "topk": "NeuralEngine",
+   "cast": "CPU"
+  },
+  "neural_MB": 12.20608,
+  "rss_MB": 116.473856,
+  "load_s": 0.9535859170136973
+ },
+ {
+  "model": "mlp_b1",
+  "units": "coreml-cpu",
+  "batch": 1,
+  "p50_ms": 0.042417028453201056,
+  "p95_ms": 0.045666994992643595,
+  "plan_preferred": {
+   "linear": "CPU",
+   "silu": "CPU"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 77.479936,
+  "load_s": 0.22443579096579924
+ },
+ {
+  "model": "mlp_b1",
+  "units": "coreml-ane",
+  "batch": 1,
+  "p50_ms": 0.04249997437000275,
+  "p95_ms": 0.04533299943432212,
+  "plan_preferred": {
+   "linear": "CPU",
+   "silu": "CPU"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 78.266368,
+  "load_s": 0.23628424998605624
+ },
+ {
+  "model": "mlp_b16",
+  "units": "coreml-cpu",
+  "batch": 16,
+  "p50_ms": 0.10787503561004996,
+  "p95_ms": 0.11133303632959723,
+  "plan_preferred": {
+   "linear": "NeuralEngine",
+   "silu": "NeuralEngine"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 77.725696,
+  "load_s": 0.22676479199435562
+ },
+ {
+  "model": "mlp_b16",
+  "units": "coreml-ane",
+  "batch": 16,
+  "p50_ms": 0.23254100233316422,
+  "p95_ms": 0.2548330230638385,
+  "plan_preferred": {
+   "linear": "NeuralEngine",
+   "silu": "NeuralEngine"
+  },
+  "neural_MB": 6.406144,
+  "rss_MB": 73.007104,
+  "load_s": 0.2603620839654468
+ },
+ {
+  "model": "mlp_b256",
+  "units": "coreml-cpu",
+  "batch": 256,
+  "p50_ms": 0.7020830526016653,
+  "p95_ms": 0.7192909833975136,
+  "plan_preferred": {
+   "linear": "NeuralEngine",
+   "silu": "NeuralEngine"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 89.45664,
+  "load_s": 0.22989920899271965
+ },
+ {
+  "model": "mlp_b256",
+  "units": "coreml-ane",
+  "batch": 256,
+  "p50_ms": 0.49841596046462655,
+  "p95_ms": 0.5079999682493508,
+  "plan_preferred": {
+   "linear": "NeuralEngine",
+   "silu": "NeuralEngine"
+  },
+  "neural_MB": 6.406144,
+  "rss_MB": 84.21376,
+  "load_s": 0.270462583983317
+ },
+ {
+  "model": "mlp_b1024",
+  "units": "coreml-cpu",
+  "batch": 1024,
+  "p50_ms": 2.902667038142681,
+  "p95_ms": 3.072249994147569,
+  "plan_preferred": {
+   "linear": "NeuralEngine",
+   "silu": "NeuralEngine"
+  },
+  "neural_MB": 0.0,
+  "rss_MB": 130.695168,
+  "load_s": 0.2460118749877438
+ },
+ {
+  "model": "mlp_b1024",
+  "units": "coreml-ane",
+  "batch": 1024,
+  "p50_ms": 1.763082982506603,
+  "p95_ms": 1.7943340353667736,
+  "plan_preferred": {
+   "linear": "NeuralEngine",
+   "silu": "NeuralEngine"
+  },
+  "neural_MB": 13.746176,
+  "rss_MB": 120.061952,
+  "load_s": 0.2770508750109002
+ },
+ {
+  "model": "router_b1",
+  "units": "numpy-fp32-accelerate",
+  "batch": 1,
+  "n": 300,
+  "p50_ms": 0.010000017937272787,
+  "p95_ms": 0.01025001984089613,
+  "min_ms": 0.009041978046298027,
+  "mean_ms": 0.009921251136499146
+ },
+ {
+  "model": "router_b1",
+  "units": "mlx-gpu-bf16",
+  "batch": 1,
+  "n": 300,
+  "p50_ms": 0.2209999947808683,
+  "p95_ms": 0.37408299976959825,
+  "min_ms": 0.1604169956408441,
+  "mean_ms": 0.2445741977620249
+ },
+ {
+  "model": "router_b1",
+  "units": "mlx-cpu-bf16",
+  "batch": 1,
+  "n": 300,
+  "p50_ms": 0.018957944121211767,
+  "p95_ms": 0.02033304190263152,
+  "min_ms": 0.01741695450618863,
+  "mean_ms": 0.019177166395820677
+ },
+ {
+  "model": "router_b1",
+  "units": "mlx-gpu-fp16",
+  "batch": 1,
+  "n": 300,
+  "p50_ms": 0.20104105351492763,
+  "p95_ms": 0.21475000539794564,
+  "min_ms": 0.15770801110193133,
+  "mean_ms": 0.20060220616869628
+ },
+ {
+  "model": "router_b16",
+  "units": "numpy-fp32-accelerate",
+  "batch": 16,
+  "n": 300,
+  "p50_ms": 0.04070898285135627,
+  "p95_ms": 0.042832980398088694,
+  "min_ms": 0.04033301956951618,
+  "mean_ms": 0.04113891239588459
+ },
+ {
+  "model": "router_b16",
+  "units": "mlx-gpu-bf16",
+  "batch": 16,
+  "n": 300,
+  "p50_ms": 0.1996250357478857,
+  "p95_ms": 0.22079201880842447,
+  "min_ms": 0.13245799345895648,
+  "mean_ms": 0.20081748856076348
+ },
+ {
+  "model": "router_b16",
+  "units": "mlx-cpu-bf16",
+  "batch": 16,
+  "n": 300,
+  "p50_ms": 0.08012499893084168,
+  "p95_ms": 0.08995801908895373,
+  "min_ms": 0.07862498750910163,
+  "mean_ms": 0.08208092437901844
+ },
+ {
+  "model": "router_b16",
+  "units": "mlx-gpu-fp16",
+  "batch": 16,
+  "n": 300,
+  "p50_ms": 0.1966250129044056,
+  "p95_ms": 0.21845800802111626,
+  "min_ms": 0.14441704843193293,
+  "mean_ms": 0.1980983609488855
+ },
+ {
+  "model": "router_b256",
+  "units": "numpy-fp32-accelerate",
+  "batch": 256,
+  "n": 300,
+  "p50_ms": 0.9857079712674022,
+  "p95_ms": 1.1681250180117786,
+  "min_ms": 0.9785830043256283,
+  "mean_ms": 1.0322437074501067
+ },
+ {
+  "model": "router_b256",
+  "units": "mlx-gpu-bf16",
+  "batch": 256,
+  "n": 300,
+  "p50_ms": 0.49279199447482824,
+  "p95_ms": 0.6030829972587526,
+  "min_ms": 0.45904197031632066,
+  "mean_ms": 0.5391573841916397
+ },
+ {
+  "model": "router_b256",
+  "units": "mlx-cpu-bf16",
+  "batch": 256,
+  "n": 300,
+  "p50_ms": 1.2784579885192215,
+  "p95_ms": 1.3452080311253667,
+  "min_ms": 1.2584999785758555,
+  "mean_ms": 1.2912571554382641
+ },
+ {
+  "model": "router_b256",
+  "units": "mlx-gpu-fp16",
+  "batch": 256,
+  "n": 300,
+  "p50_ms": 0.49287499859929085,
+  "p95_ms": 0.6289589800871909,
+  "min_ms": 0.4486669786274433,
+  "mean_ms": 0.5403988860780373
+ },
+ {
+  "model": "router_b1024",
+  "units": "numpy-fp32-accelerate",
+  "batch": 1024,
+  "n": 300,
+  "p50_ms": 4.983042017556727,
+  "p95_ms": 5.244874977506697,
+  "min_ms": 4.789082973729819,
+  "mean_ms": 4.999235916184261
+ },
+ {
+  "model": "router_b1024",
+  "units": "mlx-gpu-bf16",
+  "batch": 1024,
+  "n": 300,
+  "p50_ms": 1.3696670066565275,
+  "p95_ms": 1.4451249735429883,
+  "min_ms": 1.2140839826315641,
+  "mean_ms": 1.3708341630020489
+ },
+ {
+  "model": "router_b1024",
+  "units": "mlx-cpu-bf16",
+  "batch": 1024,
+  "n": 300,
+  "p50_ms": 6.472375011071563,
+  "p95_ms": 6.845625001005828,
+  "min_ms": 6.277874985244125,
+  "mean_ms": 6.508016811179308
+ },
+ {
+  "model": "router_b1024",
+  "units": "mlx-gpu-fp16",
+  "batch": 1024,
+  "n": 300,
+  "p50_ms": 1.3632079935632646,
+  "p95_ms": 1.4370830031111836,
+  "min_ms": 1.2476250412873924,
+  "mean_ms": 1.380688063800335
+ }
+]

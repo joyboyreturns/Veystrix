@@ -1,0 +1,510 @@
+[
+ {
+  "gpu_workload": "gpu-compute",
+  "side": "none",
+  "round": 0,
+  "gpu": {
+   "role": "gpu-compute",
+   "n": 184,
+   "calls_per_s": 46.0,
+   "p50_ms": 21.585249982308596,
+   "p95_ms": 22.082582989241928,
+   "min_ms": 21.351666015107185,
+   "mean_ms": 21.818425988781005
+  },
+  "side_result": null,
+  "battery": {
+   "percent": 72,
+   "on_ac": false
+  }
+ },
+ {
+  "gpu_workload": "gpu-compute",
+  "side": "ANE predictor 200 Hz",
+  "round": 0,
+  "gpu": {
+   "role": "gpu-compute",
+   "n": 184,
+   "calls_per_s": 46.0,
+   "p50_ms": 21.59004204440862,
+   "p95_ms": 21.75083296606317,
+   "min_ms": 21.32900001015514,
+   "mean_ms": 21.77192956245879
+  },
+  "side_result": {
+   "role": "ane",
+   "n": 800,
+   "calls_per_s": 200.0,
+   "p50_ms": 1.554209040477872,
+   "p95_ms": 1.665416988544166,
+   "min_ms": 0.7659579860046506,
+   "mean_ms": 1.5351479469973128
+  },
+  "battery": {
+   "percent": 72,
+   "on_ac": false
+  }
+ },
+ {
+  "gpu_workload": "gpu-compute",
+  "side": "ANE predictor flat out",
+  "round": 0,
+  "gpu": {
+   "role": "gpu-compute",
+   "n": 185,
+   "calls_per_s": 46.25,
+   "p50_ms": 21.47987496573478,
+   "p95_ms": 21.780541981570423,
+   "min_ms": 21.179334027692676,
+   "mean_ms": 21.677954962187624
+  },
+  "side_result": {
+   "role": "ane",
+   "n": 8925,
+   "calls_per_s": 2231.25,
+   "p50_ms": 0.42466603918001056,
+   "p95_ms": 0.6572079728357494,
+   "min_ms": 0.38416602183133364,
+   "mean_ms": 0.44802060763609886
+  },
+  "battery": {
+   "percent": 71,
+   "on_ac": false
+  }
+ },
+ {
+  "gpu_workload": "gpu-compute",
+  "side": "ANE saturating matmul",
+  "round": 0,
+  "gpu": {
+   "role": "gpu-compute",
+   "n": 184,
+   "calls_per_s": 46.0,
+   "p50_ms": 21.67675003875047,
+   "p95_ms": 21.845625014975667,
+   "min_ms": 21.357833000365645,
+   "mean_ms": 21.849433413476422
+  },
+  "side_result": {
+   "role": "ane",
+   "n": 1303,
+   "calls_per_s": 325.75,
+   "p50_ms": 3.0453329673036933,
+   "p95_ms": 4.056042002048343,
+   "min_ms": 1.66787498164922,
+   "mean_ms": 3.06848669138752
+  },
+  "battery": {
+   "percent": 71,
+   "on_ac": false
+  }
+ },
+ {
+  "gpu_workload": "gpu-compute",
+  "side": "CPU Core ML predictor flat out",
+  "round": 0,
+  "gpu": {
+   "role": "gpu-compute",
+   "n": 184,
+   "calls_per_s": 46.0,
+   "p50_ms": 21.63629198912531,
+   "p95_ms": 21.944584033917636,
+   "min_ms": 21.206499950494617,
+   "mean_ms": 21.783151710659023
+  },
+  "side_result": {
+   "role": "cpu",
+   "n": 9397,
+   "calls_per_s": 2349.25,
+   "p50_ms": 0.4219579859636724,
+   "p95_ms": 0.4338329890742898,
+   "min_ms": 0.3969169920310378,
+   "mean_ms": 0.42545653192102045
+  },
+  "battery": {
+   "percent": 71,
+   "on_ac": false
+  }
+ },
+ {
+  "gpu_workload": "gpu-compute",
+  "side": "CPU Core ML predictor flat out",
+  "round": 1,
+  "gpu": {
+   "role": "gpu-compute",
+   "n": 184,
+   "calls_per_s": 46.0,
+   "p50_ms": 21.57341700512916,
+   "p95_ms": 21.8948750407435,
+   "min_ms": 21.121707977727056,
+   "mean_ms": 21.748900793128364
+  },
+  "side_result": {
+   "role": "cpu",
+   "n": 9493,
+   "calls_per_s": 2373.25,
+   "p50_ms": 0.41874998714774847,
+   "p95_ms": 0.42633299017325044,
+   "min_ms": 0.39758405182510614,
+   "mean_ms": 0.4211853665060236
+  },
+  "battery": {
+   "percent": 71,
+   "on_ac": false
+  }
+ },
+ {
+  "gpu_workload": "gpu-compute",
+  "side": "ANE saturating matmul",
+  "round": 1,
+  "gpu": {
+   "role": "gpu-compute",
+   "n": 184,
+   "calls_per_s": 46.0,
+   "p50_ms": 21.66908304207027,
+   "p95_ms": 21.91954100271687,
+   "min_ms": 21.35762496618554,
+   "mean_ms": 21.813713801827323
+  },
+  "side_result": {
+   "role": "ane",
+   "n": 1322,
+   "calls_per_s": 330.5,
+   "p50_ms": 3.022250020876527,
+   "p95_ms": 4.101208003703505,
+   "min_ms": 1.6520830104127526,
+   "mean_ms": 3.0238002228005345
+  },
+  "battery": {
+   "percent": 71,
+   "on_ac": false
+  }
+ },
+ {
+  "gpu_workload": "gpu-compute",
+  "side": "ANE predictor flat out",
+  "round": 1,
+  "gpu": {
+   "role": "gpu-compute",
+   "n": 185,
+   "calls_per_s": 46.25,
+   "p50_ms": 21.562375011853874,
+   "p95_ms": 21.771791973151267,
+   "min_ms": 21.326957968994975,
+   "mean_ms": 21.727109209923828
+  },
+  "side_result": {
+   "role": "ane",
+   "n": 7583,
+   "calls_per_s": 1895.75,
+   "p50_ms": 0.42925000889226794,
+   "p95_ms": 1.0998749639838934,
+   "min_ms": 0.3813750226981938,
+   "mean_ms": 0.5272184648445055
+  },
+  "battery": {
+   "percent": 71,
+   "on_ac": false
+  }
+ },
+ {
+  "gpu_workload": "gpu-compute",
+  "side": "ANE predictor 200 Hz",
+  "round": 1,
+  "gpu": {
+   "role": "gpu-compute",
+   "n": 184,
+   "calls_per_s": 46.0,
+   "p50_ms": 21.641625033225864,
+   "p95_ms": 21.827624994330108,
+   "min_ms": 21.421542041935027,
+   "mean_ms": 21.79887498863062
+  },
+  "side_result": {
+   "role": "ane",
+   "n": 800,
+   "calls_per_s": 200.0,
+   "p50_ms": 1.5396249946206808,
+   "p95_ms": 1.6343340394087136,
+   "min_ms": 0.7737500127404928,
+   "mean_ms": 1.5199411405046703
+  },
+  "battery": {
+   "percent": 71,
+   "on_ac": false
+  }
+ },
+ {
+  "gpu_workload": "gpu-compute",
+  "side": "none",
+  "round": 1,
+  "gpu": {
+   "role": "gpu-compute",
+   "n": 185,
+   "calls_per_s": 46.25,
+   "p50_ms": 21.528416022192687,
+   "p95_ms": 21.748416998889297,
+   "min_ms": 21.243125025648624,
+   "mean_ms": 21.731809494903665
+  },
+  "side_result": null,
+  "battery": {
+   "percent": 70,
+   "on_ac": false
+  }
+ },
+ {
+  "gpu_workload": "gpu-bandwidth",
+  "side": "none",
+  "round": 0,
+  "gpu": {
+   "role": "gpu-bandwidth",
+   "n": 488,
+   "calls_per_s": 122.0,
+   "p50_ms": 8.116916986182332,
+   "p95_ms": 8.251958002801985,
+   "min_ms": 8.001208014320582,
+   "mean_ms": 8.206774578210286
+  },
+  "side_result": null,
+  "battery": {
+   "percent": 70,
+   "on_ac": false
+  }
+ },
+ {
+  "gpu_workload": "gpu-bandwidth",
+  "side": "ANE predictor 200 Hz",
+  "round": 0,
+  "gpu": {
+   "role": "gpu-bandwidth",
+   "n": 471,
+   "calls_per_s": 117.75,
+   "p50_ms": 8.413332980126143,
+   "p95_ms": 8.703790954314172,
+   "min_ms": 8.125208027195185,
+   "mean_ms": 8.495446028718785
+  },
+  "side_result": {
+   "role": "ane",
+   "n": 800,
+   "calls_per_s": 200.0,
+   "p50_ms": 1.4767079846933484,
+   "p95_ms": 1.6757079865783453,
+   "min_ms": 0.4953339812345803,
+   "mean_ms": 1.38749499914411
+  },
+  "battery": {
+   "percent": 70,
+   "on_ac": false
+  }
+ },
+ {
+  "gpu_workload": "gpu-bandwidth",
+  "side": "ANE predictor flat out",
+  "round": 0,
+  "gpu": {
+   "role": "gpu-bandwidth",
+   "n": 416,
+   "calls_per_s": 104.0,
+   "p50_ms": 9.548625035677105,
+   "p95_ms": 9.675999986939132,
+   "min_ms": 8.929124975111336,
+   "mean_ms": 9.634155136714421
+  },
+  "side_result": {
+   "role": "ane",
+   "n": 8795,
+   "calls_per_s": 2198.75,
+   "p50_ms": 0.45137497363612056,
+   "p95_ms": 0.46508299419656396,
+   "min_ms": 0.40375004755333066,
+   "mean_ms": 0.45469657373294287
+  },
+  "battery": {
+   "percent": 70,
+   "on_ac": false
+  }
+ },
+ {
+  "gpu_workload": "gpu-bandwidth",
+  "side": "ANE saturating matmul",
+  "round": 0,
+  "gpu": {
+   "role": "gpu-bandwidth",
+   "n": 428,
+   "calls_per_s": 107.0,
+   "p50_ms": 9.319958044216037,
+   "p95_ms": 9.586333006154746,
+   "min_ms": 8.771791006438434,
+   "mean_ms": 9.360402553352074
+  },
+  "side_result": {
+   "role": "ane",
+   "n": 1425,
+   "calls_per_s": 356.25,
+   "p50_ms": 2.8969580307602882,
+   "p95_ms": 3.153082972858101,
+   "min_ms": 1.545500010251999,
+   "mean_ms": 2.804933770420847
+  },
+  "battery": {
+   "percent": 70,
+   "on_ac": false
+  }
+ },
+ {
+  "gpu_workload": "gpu-bandwidth",
+  "side": "CPU Core ML predictor flat out",
+  "round": 0,
+  "gpu": {
+   "role": "gpu-bandwidth",
+   "n": 477,
+   "calls_per_s": 119.25,
+   "p50_ms": 8.300999994389713,
+   "p95_ms": 8.560209011193365,
+   "min_ms": 8.204709040001035,
+   "mean_ms": 8.394182774880647
+  },
+  "side_result": {
+   "role": "cpu",
+   "n": 9179,
+   "calls_per_s": 2294.75,
+   "p50_ms": 0.43358298717066646,
+   "p95_ms": 0.4469160339795053,
+   "min_ms": 0.3971660044044256,
+   "mean_ms": 0.43567317671995104
+  },
+  "battery": {
+   "percent": 70,
+   "on_ac": false
+  }
+ },
+ {
+  "gpu_workload": "gpu-bandwidth",
+  "side": "CPU Core ML predictor flat out",
+  "round": 1,
+  "gpu": {
+   "role": "gpu-bandwidth",
+   "n": 476,
+   "calls_per_s": 119.0,
+   "p50_ms": 8.31870804540813,
+   "p95_ms": 8.471707988064736,
+   "min_ms": 8.234790991991758,
+   "mean_ms": 8.418893836538441
+  },
+  "side_result": {
+   "role": "cpu",
+   "n": 9059,
+   "calls_per_s": 2264.75,
+   "p50_ms": 0.4373749834485352,
+   "p95_ms": 0.45370805310085416,
+   "min_ms": 0.40687498403713107,
+   "mean_ms": 0.4413662609495782
+  },
+  "battery": {
+   "percent": 70,
+   "on_ac": false
+  }
+ },
+ {
+  "gpu_workload": "gpu-bandwidth",
+  "side": "ANE saturating matmul",
+  "round": 1,
+  "gpu": {
+   "role": "gpu-bandwidth",
+   "n": 426,
+   "calls_per_s": 106.5,
+   "p50_ms": 9.349207975901663,
+   "p95_ms": 9.68487496720627,
+   "min_ms": 8.722541970200837,
+   "mean_ms": 9.406016060116182
+  },
+  "side_result": {
+   "role": "ane",
+   "n": 1487,
+   "calls_per_s": 371.75,
+   "p50_ms": 2.772832987830043,
+   "p95_ms": 3.1391250086016953,
+   "min_ms": 1.5889159985817969,
+   "mean_ms": 2.689478724088555
+  },
+  "battery": {
+   "percent": 70,
+   "on_ac": false
+  }
+ },
+ {
+  "gpu_workload": "gpu-bandwidth",
+  "side": "ANE predictor flat out",
+  "round": 1,
+  "gpu": {
+   "role": "gpu-bandwidth",
+   "n": 414,
+   "calls_per_s": 103.5,
+   "p50_ms": 9.56187496194616,
+   "p95_ms": 9.738416993059218,
+   "min_ms": 9.053917019627988,
+   "mean_ms": 9.669475946890342
+  },
+  "side_result": {
+   "role": "ane",
+   "n": 8785,
+   "calls_per_s": 2196.25,
+   "p50_ms": 0.4504160024225712,
+   "p95_ms": 0.48216700088232756,
+   "min_ms": 0.4059579805471003,
+   "mean_ms": 0.45510681001384684
+  },
+  "battery": {
+   "percent": 69,
+   "on_ac": false
+  }
+ },
+ {
+  "gpu_workload": "gpu-bandwidth",
+  "side": "ANE predictor 200 Hz",
+  "round": 1,
+  "gpu": {
+   "role": "gpu-bandwidth",
+   "n": 472,
+   "calls_per_s": 118.0,
+   "p50_ms": 8.406374952755868,
+   "p95_ms": 8.57920799171552,
+   "min_ms": 8.169832988642156,
+   "mean_ms": 8.480884015517727
+  },
+  "side_result": {
+   "role": "ane",
+   "n": 800,
+   "calls_per_s": 200.0,
+   "p50_ms": 1.59258401254192,
+   "p95_ms": 1.7211249796673656,
+   "min_ms": 0.8077920065261424,
+   "mean_ms": 1.576022093067877
+  },
+  "battery": {
+   "percent": 69,
+   "on_ac": false
+  }
+ },
+ {
+  "gpu_workload": "gpu-bandwidth",
+  "side": "none",
+  "round": 1,
+  "gpu": {
+   "role": "gpu-bandwidth",
+   "n": 487,
+   "calls_per_s": 121.75,
+   "p50_ms": 8.137291006278247,
+   "p95_ms": 8.26375000178814,
+   "min_ms": 8.021083020139486,
+   "mean_ms": 8.216768667055007
+  },
+  "side_result": null,
+  "battery": {
+   "percent": 69,
+   "on_ac": false
+  }
+ }
+]

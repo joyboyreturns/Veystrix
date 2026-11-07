@@ -1,0 +1,103 @@
+{
+ "numerics_cpu": {
+  "rows": 2048,
+  "identical_top10_set": 0.8994140625,
+  "mean_overlap": 0.989794921875,
+  "max_abs_logit_diff": 0.04901838302612305,
+  "mean_abs_logit_diff": 0.003881655400618911
+ },
+ "numerics_ane": {
+  "rows": 2048,
+  "identical_top10_set": 0.98779296875,
+  "mean_overlap": 0.998779296875,
+  "max_abs_logit_diff": 0.0021352767944335938,
+  "mean_abs_logit_diff": 0.0002393372415099293
+ },
+ "matmul_1024x2560x2560_coreml-cpu": {
+  "p50_ms": 5.319375020917505,
+  "tflops": 2.523186041070848,
+  "neural_MB": 0.0
+ },
+ "matmul_1024x2560x2560_coreml-ane": {
+  "p50_ms": 3.1951250275596976,
+  "tflops": 4.200703473019016,
+  "neural_MB": 18.448384
+ },
+ "matmul_1024x2560x2560_mlx-gpu-fp16": {
+  "p50_ms": 4.360000020824373,
+  "tflops": 3.0783882421776365,
+  "neural_MB": 0.0
+ },
+ "memory_cpu": [
+  {
+   "step": "start",
+   "rss_MB": 31.522816,
+   "neural_MB": 0.0
+  },
+  {
+   "step": "import coremltools",
+   "rss_MB": 90.882048,
+   "neural_MB": 0.0
+  },
+  {
+   "step": "load+first predict #1",
+   "seconds": 0.038816291955299675,
+   "rss_MB": 136.249344,
+   "neural_MB": 0.0
+  },
+  {
+   "step": "load+first predict #2",
+   "seconds": 0.029691959032788873,
+   "rss_MB": 146.243584,
+   "neural_MB": 0.0
+  },
+  {
+   "step": "load+first predict #3",
+   "seconds": 0.030025915999431163,
+   "rss_MB": 150.781952,
+   "neural_MB": 0.0
+  },
+  {
+   "step": "load+first predict #4",
+   "seconds": 0.029310083016753197,
+   "rss_MB": 155.2384,
+   "neural_MB": 0.0
+  }
+ ],
+ "memory_ane": [
+  {
+   "step": "start",
+   "rss_MB": 31.45728,
+   "neural_MB": 0.0
+  },
+  {
+   "step": "import coremltools",
+   "rss_MB": 90.783744,
+   "neural_MB": 0.0
+  },
+  {
+   "step": "load+first predict #1",
+   "seconds": 0.07497312501072884,
+   "rss_MB": 115.9168,
+   "neural_MB": 2.719744
+  },
+  {
+   "step": "load+first predict #2",
+   "seconds": 0.06638912501512095,
+   "rss_MB": 117.768192,
+   "neural_MB": 5.439488
+  },
+  {
+   "step": "load+first predict #3",
+   "seconds": 0.05947704199934378,
+   "rss_MB": 119.504896,
+   "neural_MB": 8.159232
+  },
+  {
+   "step": "load+first predict #4",
+   "seconds": 0.058251667011063546,
+   "rss_MB": 121.176064,
+   "neural_MB": 10.878976
+  }
+ ]
+}
