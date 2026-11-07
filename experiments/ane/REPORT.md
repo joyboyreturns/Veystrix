@@ -13,6 +13,8 @@ Tags: **[measured]** here; **[recorded]** from `docs/flashnext/research.md`; **[
 
 ## 0. Conditions and limits
 
+**Correction, 2026-11-07:** an earlier version of this report extrapolated over 40 layers (56 ms, 270 MB). The checkpoint's config has 48 layers, so those two figures are 68 ms and 310 MB. The conclusion is unchanged.
+
 * M4 MacBook Air, 16 GB, macOS 27.2, Core ML via coremltools 9.0, MLX 0.32.2, in an isolated venv (the repo `.venv` is untouched).
 * **On battery (75% to 68%), Low Power Mode off, no thermal warning.** These are preliminary numbers, not plugged-in numbers. A battery guard (stop below 25%) ran before every case.
 * Every predictor uses **random weights**. Latency, placement and memory do not depend on weight values. **Predictor accuracy was not measured**, and nothing below claims it.
@@ -57,7 +59,7 @@ Throughput at large fp16 matmuls (includes marshalling): 1024x2560x2560 ANE **4.
 
 * Core ML runtime import: +59 MB RSS (31 -> 91 MB). **[measured]**
 * One ANE router model: +25 MB RSS for the first, about +2 MB for each further one, **2.72 MB** ANE footprint each (7.96 to 18.4 MB for larger models). The same model on CPU: +45 MB first, then about +4 to 10 MB each. **[measured]**
-* **[estimate]** 40 per-layer routers on the ANE: about 109 MB ANE footprint plus about 100 MB RSS plus the 59 MB runtime, roughly **270 MB**. The recorded prefill left about 100 MB free and the guard headroom is about 0.6 GB (`docs/flashnext/prefetch-integration.md` sections 5 and 12.7).
+* **[estimate]** 48 per-layer routers on the ANE (the checkpoint has 48 layers, all with routed experts): about 130 MB ANE footprint (48 x 2.72 MB) plus about 120 MB RSS plus the 59 MB runtime, roughly **310 MB**. The recorded prefill left about 100 MB free and the guard headroom is about 0.6 GB (`docs/flashnext/prefetch-integration.md` sections 5 and 12.7).
 
 ## 4. Overlap with GPU work (task 5)
 
@@ -81,8 +83,8 @@ Separate processes (no shared GIL) start together; times are the GPU worker's p5
 
 1. **Decode:** the predictor is not the bottleneck and the ANE does not even run it (batch 1 stays on the CPU, 10 to 35 us). **[recorded]** a lead-1 predictor recovers 72% of top-10 (4.2 wasted reads per layer); a *perfect* predictor with overlapped reads tied the baseline (+0.1%, -2.9%, -0.7%); early submit lost 8.2%; the cause is memory-controller contention. Section 4 shows ANE traffic adds to that contention rather than avoiding it.
 2. **Prefill, 2048 tokens and up:** about 400 of 512 experts are routed per layer **[recorded]**, so everything is staged and no prediction is needed.
-3. **Prefill, 1K:** about 334 of 512 experts per layer. **[estimate]** the 1024-token router costs 1.4 ms per layer, about 56 ms over 40 layers, 0.1% of the recorded 49.3 s prefill. The cost is reads (25.6 s) and GPU drain (14.9 s), not prediction, and Stage 1 deliberately does not overlap reads with GPU work.
-4. Cost of trying: about 270 MB **[estimate]**, a private framework dependency, and a GPU-to-ANE copy per layer.
+3. **Prefill, 1K:** about 334 of 512 experts per layer. **[estimate]** the 1024-token router costs 1.4 ms per layer, about 68 ms over 48 layers, 0.14% of the recorded 49.3 s prefill. The cost is reads (25.6 s) and GPU drain (14.9 s), not prediction, and Stage 1 deliberately does not overlap reads with GPU work.
+4. Cost of trying: about 310 MB **[estimate]**, a private framework dependency, and a GPU-to-ANE copy per layer.
 
 ## 6. Other operations on the ANE (task 7)
 
