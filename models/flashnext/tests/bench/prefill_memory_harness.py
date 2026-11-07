@@ -12,6 +12,7 @@ child-process supervisor, and the exactness, gate and paired-effect analysis.
 from __future__ import annotations
 
 import hashlib
+import os
 import re
 import statistics
 import subprocess
@@ -19,7 +20,9 @@ import time
 from dataclasses import dataclass, field
 from typing import Callable
 
-SIZES = {"1k": 1024, "2k": 2048, "4k": 4096}
+SIZES = {"1k": 1024, "2k": 2048, "4k": 4096}                  # the planned matrix (section 14)
+DIAGNOSTIC_SIZES = {"128": 128, "256": 256}                   # short prompts for memory diagnosis only
+ALL_SIZES = {**DIAGNOSTIC_SIZES, **SIZES}
 DECODE_TOKENS = 128
 RING_EXPERTS = 512
 FOLLOW_UP_OFFSET = 20000
@@ -28,9 +31,15 @@ TEMPLATE_OVERHEAD_LATER = 23      # preface and markers around a later user text
 METAL_LIMIT_BYTES = 12_713_115_648   # recorded on this machine; the child reads the live value
 HEADROOM_BYTES = 500_000_000      # G3
 NEXT_SIZE_HEADROOM_BYTES = 2_000_000_000
+MIN_AVAILABLE_GB = 2.0            # stop before macOS reaches a pressure level: free + inactive + speculative
+GUARD_HEADROOM_BYTES = 500_000_000   # MLX active + cache must stay this far under the Metal limit
+MAX_COMPRESSOR_GROWTH_GIB = 2.0   # per arm, relative to the arm's own starting compressor size
+COMPRESSOR_STOP_AVAILABLE_GIB = 3.0   # growth over the limit only stops the arm below this much available memory
+FAST_TRACE_SECONDS = 0.25         # child sampling interval during prefill (cheap readings only)
+GUARD_EXIT_CODE = 75              # the child's own memory guard stopped it (EX_TEMPFAIL)
 CLEANUP_TOLERANCE_BYTES = 250_000_000   # G4
 MIN_ROUNDS_FOR_EFFECT = 3
-TIME_LIMIT_SECONDS = {"1k": 600, "2k": 1200, "4k": 2400}
+TIME_LIMIT_SECONDS = {"128": 300, "256": 300, "1k": 600, "2k": 1200, "4k": 2400}
 
 CACHE_WARNING = (
     "The first arm of a group reads the checkpoint cold from SSD and later arms find part of it in the page "
@@ -70,10 +79,13 @@ class Condition:
     guarded: bool = False     # runs last, only at the sizes in ``only_sizes``
     only_sizes: tuple[str, ...] = ()
     summary: str = ""
+    # Test-only control: the baseline with F_NOCACHE on the store's shard descriptors, set by the
+    # benchmark child on its own store object. No environment flag, no production change.
+    uncached_reads: bool = False
 
     @property
     def is_baseline(self) -> bool:
-        return self.ring == 0 and not self.scratch and self.cache_mb == 0
+        return self.ring == 0 and not self.scratch and self.cache_mb == 0 and not self.uncached_reads
 
     @property
     def ring_on(self) -> bool:
@@ -95,6 +107,17 @@ CONDITIONS: dict[str, Condition] = {c.id: c for c in (
     Condition("S2", "second", ring=RING_EXPERTS, cache_mb=512,
               summary="in-pool ring and 512 MB cache cap"),
 )}
+# Not in the planned matrix: diagnostic controls, run only when named.
+SMALL_RING_EXPERTS = 256          # half the planned ring: a 0.84 GB scratch pool instead of 1.62 GB
+
+DIAGNOSTIC_CONDITIONS: dict[str, Condition] = {c.id: c for c in (
+    Condition("F2s", "first", ring=SMALL_RING_EXPERTS, scratch=True,
+              summary="diagnostic: F2 with a 256-expert scratch ring; a layer that routes more experts "
+                      "than 256 falls back to the normal read path"),
+    Condition("F0u", "first", uncached_reads=True,
+              summary="test-only control: baseline with uncached (F_NOCACHE) expert reads; no pool, no ring"),
+)}
+ALL_CONDITIONS = {**CONDITIONS, **DIAGNOSTIC_CONDITIONS}
 BASELINES = {"first": "F0", "second": "S0"}
 
 
@@ -167,15 +190,15 @@ def build_schedule(sizes: list[str], conditions: list[str], rounds: int) -> list
     order, odd rounds reversed."""
     if rounds < 1:
         raise ValueError("rounds must be at least 1")
-    unknown = [name for name in conditions if name not in CONDITIONS]
+    unknown = [name for name in conditions if name not in ALL_CONDITIONS]
     if unknown:
         raise ValueError(f"unknown conditions: {unknown}")
-    bad = [name for name in sizes if name not in SIZES]
+    bad = [name for name in sizes if name not in ALL_SIZES]
     if bad:
         raise ValueError(f"unknown sizes: {bad}")
     arms: list[Arm] = []
-    for size in sorted(sizes, key=lambda name: SIZES[name]):
-        chosen = [CONDITIONS[name] for name in conditions]
+    for size in sorted(sizes, key=lambda name: ALL_SIZES[name]):
+        chosen = [ALL_CONDITIONS[name] for name in conditions]
         allowed = [c for c in chosen if not c.only_sizes or size in c.only_sizes]
         blocks = [
             [c.id for c in allowed if c.turn == "first" and not c.guarded],
@@ -285,11 +308,15 @@ class Sampler:
     def __init__(self, runner: Callable[[list[str]], str] = _run_text,
                  vm: Callable[[], dict] | None = None,
                  clock: Callable[[], float] = time.time,
-                 load: Callable[[], float] | None = None):
+                 load: Callable[[], float] | None = None,
+                 available: Callable[[], float | None] | None = None,
+                 memory: Callable[[], dict] | None = None):
         self.runner = runner
         self.vm = vm
         self.clock = clock
         self.load = load
+        self.available = available
+        self.memory = memory
 
     def sample(self) -> dict:
         battery = parse_battery(self.runner(["pmset", "-g", "batt"]))
@@ -309,6 +336,13 @@ class Sampler:
         }
         if self.load is not None:
             record["load"] = self.load()
+        if self.available is not None:
+            record["available_mb"] = self.available()
+        if self.memory is not None:        # one vm_stat read: available, compressor, page cache
+            reading = self.memory() or {}
+            for key in ("available_mb", "compressor_mb", "file_backed_mb"):
+                if reading.get(key) is not None:
+                    record[key] = reading[key]
         if self.vm is not None:
             record["vm"] = self.vm()
         return record
@@ -323,10 +357,40 @@ def vm_delta(before: dict | None, after: dict | None) -> dict:
 
 # -- safety -----------------------------------------------------------------
 
+def _page_bytes() -> int:
+    """The VM page size ``vm_stat`` counts in (16 KiB on Apple silicon)."""
+    try:
+        return int(os.sysconf("SC_PAGE_SIZE"))
+    except (AttributeError, ValueError, OSError):
+        return 16384
+
+
+def swapin_mib(vm: dict | None, page_bytes: int) -> float:
+    """Swap-in growth in MiB from a counter movement (the counters are in pages)."""
+    return max((vm or {}).get("swapin", 0), 0) * page_bytes / (1024 * 1024)
+
+
 @dataclass
 class SafetyPolicy:
     min_battery_percent: int = 25
     swap_growth_mb: float = 64.0
+    # Cumulative swap-in growth allowed per arm, measured from that arm's own counter.
+    # A few pages are touched back in when a process maps its memory while old swap
+    # from other processes exists (a 4-page, 64 KiB swap-in stopped the first real run),
+    # so a tiny historical swap-in is not swapping. Swap-out stays strict.
+    swapin_limit_mib: float = 64.0
+    # Stop on low available memory, not only on a macOS pressure level (level 4 was
+    # reached within one 5 s sample on the first real run).
+    min_available_gb: float = MIN_AVAILABLE_GB
+    # The compressor holds memory macOS squeezed out of other pages. Growth of this much in
+    # one arm means the arm is pushing the machine into compression (2.75 GB at 128 tokens
+    # in F0), which "available memory" does not show because page cache counts as available.
+    compressor_limit_mib: float = MAX_COMPRESSOR_GROWTH_GIB * 1024
+    # Growth over that limit is a WARNING (recorded, never silent). It stops the arm only together
+    # with low available memory: five arms were stopped by growth alone while pressure was 1,
+    # 3.8 GB or more was available and nothing swapped, which answered nothing.
+    compressor_stop_available_mib: float = COMPRESSOR_STOP_AVAILABLE_GIB * 1024
+    page_bytes: int = field(default_factory=_page_bytes)
     pressure_stop_level: int = 2
     thermal_floor: int = 100
     thermal_samples: int = 2
@@ -342,11 +406,31 @@ class Watchdog:
     start: dict
     throttled: int = 0
     history: list = field(default_factory=list)
+    last: dict = field(default_factory=dict)  # the figures behind the latest check
+    warnings: list = field(default_factory=list)  # compressor growth over the limit, without a stop
 
-    def check(self, sample: dict, vm: dict | None = None) -> str | None:
-        """A stop reason, or None. ``vm`` is the counter movement since the arm began."""
+    def check(self, sample: dict, vm: dict | None = None, arm_start: dict | None = None) -> str | None:
+        """A stop reason, or None. ``vm`` is the counter movement since the arm began and
+        ``arm_start`` the machine sample taken just before it (the compressor baseline).
+
+        The figures behind the check are saved in ``last`` before any rule can
+        return, so the sample that triggers a stop is always in the trace."""
         policy = self.policy
         self.history.append(sample)
+        grown = swapin_mib(vm, policy.page_bytes)
+        level = sample.get("pressure_level")
+        compressor = sample.get("compressor_mb")
+        compressor_base = (arm_start or {}).get("compressor_mb")
+        growth = (compressor - compressor_base
+                  if compressor is not None and compressor_base is not None else None)
+        self.last = {"t": sample.get("t"), "pressure_level": level,
+                     "swap_used_mb": sample.get("swap_used_mb"),
+                     "available_mb": sample.get("available_mb"),
+                     "compressor_mb": compressor,
+                     "compressor_growth_mb": None if growth is None else round(growth, 1),
+                     "compressor_warning": bool(growth is not None and growth > policy.compressor_limit_mib),
+                     "swapin_mib": round(grown, 3),
+                     "swapout_pages": max((vm or {}).get("swapout", 0), 0)}
         if sample.get("low_power"):
             return "Low Power Mode is on"
         percent = sample.get("battery_percent")
@@ -358,12 +442,25 @@ class Watchdog:
                 return "a final run needs AC power"
             if sample.get("low_power") is None:
                 return "Low Power Mode state is unreadable in a final run"
-        level = sample.get("pressure_level")
         if level is not None and level >= policy.pressure_stop_level:
             return f"memory pressure level {level}"
-        moved = [name for name in ("swapin", "swapout") if (vm or {}).get(name, 0) > 0]
-        if moved:
-            return "swapping began (" + ", ".join(moved) + ")"
+        available = sample.get("available_mb")
+        if available is not None and available < policy.min_available_gb * 1000:
+            return (f"available memory {available / 1000:.2f} GB is below "
+                    f"{policy.min_available_gb:.1f} GB")
+        if self.last["compressor_warning"]:
+            self.warnings.append({"t": sample.get("t"), "growth_mb": round(growth, 1),
+                                  "available_mb": available})
+            if available is not None and available < policy.compressor_stop_available_mib:
+                return (f"compressor grew {growth / 1024:.2f} GiB since the arm began "
+                        f"(limit {policy.compressor_limit_mib / 1024:.0f} GiB) while only "
+                        f"{available / 1024:.2f} GiB was available "
+                        f"(floor {policy.compressor_stop_available_mib / 1024:.0f} GiB)")
+        if (vm or {}).get("swapout", 0) > 0:
+            return "swapping began (swapout)"
+        if grown > policy.swapin_limit_mib:
+            return (f"swap-in grew {grown:.1f} MiB since the arm began "
+                    f"(limit {policy.swapin_limit_mib:.0f} MiB)")
         used = sample.get("swap_used_mb")
         base = self.start.get("swap_used_mb")
         if used is not None and base is not None and used - base > policy.swap_growth_mb:
@@ -382,6 +479,8 @@ def classify_exit(returncode: int | None) -> tuple[str, str]:
     """(status, message) for a child exit status."""
     if returncode == 0:
         return "ok", "exited normally"
+    if returncode == GUARD_EXIT_CODE:
+        return "memory_guard", "the child's memory guard stopped it (see the arm's trace file)"
     if returncode in (137, -9):
         return "exit_137", "killed with SIGKILL (a memory kill is likely)"
     if returncode is not None and returncode < 0:
@@ -396,16 +495,19 @@ class ChildResult:
     message: str
     samples: list = field(default_factory=list)
     stop_reason: str | None = None
+    trace: list = field(default_factory=list)  # per-sample pressure, swap-in and swap-out
 
 
 def run_child(command: list[str], env: dict, *, timeout: float, sampler: Sampler,
-              watchdog: Watchdog, vm_start: dict | None = None, interval: float = 5.0,
+              watchdog: Watchdog, vm_start: dict | None = None, arm_start: dict | None = None,
+              interval: float = 5.0,
               popen=subprocess.Popen, sleep=time.sleep, clock=time.monotonic,
               grace: float = 10.0) -> ChildResult:
     """Run one child; sample while it runs; kill it on a stop rule or timeout."""
     proc = popen(command, env=env)
     began = clock()
     samples: list = []
+    trace: list = []
 
     def stop(reason: str, status: str) -> ChildResult:
         proc.terminate()
@@ -414,19 +516,23 @@ def run_child(command: list[str], env: dict, *, timeout: float, sampler: Sampler
             sleep(0.2)
         if proc.poll() is None:
             proc.kill()
-        return ChildResult(status, proc.poll(), reason, samples, reason)
+        return ChildResult(status, proc.poll(), reason, samples, reason, trace)
 
     while True:
         code = proc.poll()
         if code is not None:
             status, message = classify_exit(code)
-            return ChildResult(status, code, message, samples)
+            return ChildResult(status, code, message, samples, trace=trace)
         if clock() - began > timeout:
             return stop(f"exceeded {timeout:.0f} s", "timeout")
         reading = sampler.sample()
         samples.append(reading)
-        reason = watchdog.check(reading, vm_delta(vm_start, reading.get("vm")))
+        reason = watchdog.check(reading, vm_delta(vm_start, reading.get("vm")), arm_start)
+        if watchdog.last:
+            trace.append(dict(watchdog.last))
         if reason:
+            if trace:
+                trace[-1]["stop"] = reason
             return stop(reason, "stopped")
         sleep(interval)
 
@@ -637,3 +743,103 @@ def worst_headroom(arms: list[dict], size: str) -> int | None:
     """Smallest G3 headroom among the arms of one size, or None without arms."""
     values = [memory_gate(a)["headroom"] for a in arms if a["size"] == size]
     return min(values) if values else None
+
+
+def trace_summary(trace: list) -> dict:
+    """What the watchdog saw during one arm: the worst swap-in, pressure and swap-out,
+    plus the per-sample trace."""
+    levels = [x["pressure_level"] for x in trace if x.get("pressure_level") is not None]
+    return {"samples": len(trace),
+            "max_swapin_mib": max((x["swapin_mib"] for x in trace), default=0.0),
+            "max_swapout_pages": max((x["swapout_pages"] for x in trace), default=0),
+            "max_pressure_level": max(levels, default=None),
+            "min_available_mb": min((x["available_mb"] for x in trace
+                                     if x.get("available_mb") is not None), default=None),
+            "max_compressor_growth_mb": max((x["compressor_growth_mb"] for x in trace
+                                             if x.get("compressor_growth_mb") is not None), default=None),
+            "compressor_warnings": sum(1 for x in trace if x.get("compressor_warning")),
+            "trace": trace}
+
+
+# -- child-side memory tracing --------------------------------------------------
+
+def parse_vm_stat(text: str) -> dict:
+    """``vm_stat`` in one pass: page size, memory that could be reused, the compressor
+    and the cumulative counters. Sizes are in MB, counters in pages."""
+    match = re.search(r"page size of (\d+) bytes", text)
+    page = int(match.group(1)) if match else 16384
+    pages, counters = {}, {}
+    names = {"Pages free": "free", "Pages inactive": "inactive", "Pages speculative": "speculative",
+             "Pages purgeable": "purgeable", "Pages occupied by compressor": "compressor",
+             "Pages wired down": "wired", "Pages active": "active",
+             "File-backed pages": "file_backed", "Anonymous pages": "anonymous"}
+    wanted = {"Swapins": "swapin", "Swapouts": "swapout", "Pageins": "pagein", "Pageouts": "pageout",
+              "Compressions": "compress", "Decompressions": "decompress"}
+    for line in text.splitlines():
+        label, _, value = line.partition(":")
+        label, value = label.strip().strip('"'), value.strip().rstrip(".")
+        if not value.isdigit():
+            continue
+        if label in names:
+            pages[names[label]] = int(value)
+        elif label in wanted:
+            counters[wanted[label]] = int(value)
+    mb = lambda key: pages.get(key, 0) * page / 1048576  # noqa: E731
+    available = mb("free") + mb("inactive") + mb("speculative")
+    return {"page_bytes": page, "available_mb": round(available, 1),
+            "free_mb": round(mb("free"), 1), "compressor_mb": round(mb("compressor"), 1),
+            "wired_mb": round(mb("wired"), 1), "active_mb": round(mb("active"), 1),
+            "file_backed_mb": round(mb("file_backed"), 1), "anonymous_mb": round(mb("anonymous"), 1),
+            "counters": counters}
+
+
+def guard_reason(reading: dict, *, min_available_gb: float = MIN_AVAILABLE_GB,
+                 headroom_bytes: int = GUARD_HEADROOM_BYTES,
+                 compressor_limit_mib: float = MAX_COMPRESSOR_GROWTH_GIB * 1024,
+                 compressor_stop_available_mib: float = COMPRESSOR_STOP_AVAILABLE_GIB * 1024) -> str | None:
+    """The child's own stop rule, checked at every sample. Three things stop it before
+    macOS reaches a pressure level: little memory left to reuse; compressor growth over its
+    limit while available memory is below the compressor floor (growth alone only warns);
+    and MLX's own allocations (active plus cache) closing in on the Metal working-set limit."""
+    available = reading.get("available_mb")
+    if available is not None and available < min_available_gb * 1000:
+        return (f"available memory {available / 1000:.2f} GB is below "
+                f"{min_available_gb:.1f} GB")
+    growth = reading.get("compressor_growth_mb")
+    if (growth is not None and growth > compressor_limit_mib and available is not None
+            and available < compressor_stop_available_mib):
+        return (f"compressor grew {growth / 1024:.2f} GiB since the arm began "
+                f"(limit {compressor_limit_mib / 1024:.0f} GiB) while only "
+                f"{available / 1024:.2f} GiB was available "
+                f"(floor {compressor_stop_available_mib / 1024:.0f} GiB)")
+    limit = reading.get("metal_limit_bytes")
+    if limit:
+        held = reading.get("mlx_active", 0) + reading.get("mlx_cache", 0)
+        if held > limit - headroom_bytes:
+            return (f"MLX holds {held / 1e9:.2f} GB (active + cache), within "
+                    f"{headroom_bytes / 1e9:.1f} GB of the {limit / 1e9:.2f} GB Metal limit")
+    return None
+
+
+def summarize_trace(rows: list) -> dict:
+    """Per-phase extremes from a child's 1 s trace (rows without a ``phase`` are events)."""
+    phases: dict = {}
+    for row in rows:
+        phase = row.get("phase")
+        if phase is None:
+            continue
+        item = phases.setdefault(phase, {"samples": 0, "first_t": row["t"], "last_t": row["t"]})
+        item["samples"] += 1
+        item["last_t"] = row["t"]
+        for key, pick in (("mlx_active", max), ("mlx_cache", max), ("mlx_peak", max), ("rss", max),
+                          ("compressor_mb", max), ("compressor_growth_mb", max), ("file_backed_mb", max),
+                          ("swap_used_mb", max),
+                          ("pressure_level", max), ("available_mb", min)):
+            value = row.get(key)
+            if value is not None:
+                item[key] = pick(item[key], value) if key in item else value
+    return {"phases": phases,
+            "events": [row for row in rows if "event" in row],
+            "guard": next((row["guard"] for row in rows if "guard" in row), None),
+            "last_sample": next((row for row in reversed(rows) if row.get("phase") is not None), None),
+            "samples": sum(1 for row in rows if row.get("phase") is not None)}

@@ -26,6 +26,7 @@ import resource
 import shutil
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -36,6 +37,7 @@ from macqwen.results import output_path  # noqa: E402
 from models.flashnext.tests.bench import prefill_memory_harness as H  # noqa: E402
 
 MODULE = "models.flashnext.tests.bench.bench_prefill_memory"
+PRODUCTION_RING_MIN_TOKENS = 512   # prefill_ring.min_tokens() with the flag unset (a test keeps this honest)
 SOURCE_TEXT = ROOT / "docs" / "flashnext" / "research.md"
 FINGERPRINTED = (
     "models/flashnext/prefill.py", "models/flashnext/prefill_ring.py",
@@ -99,6 +101,206 @@ class RealProbe:
     def now(self) -> float:
         return time.perf_counter()
 
+    def machine(self) -> dict:
+        """One ``vm_stat`` read: available memory, compressor, counters."""
+        try:
+            out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+            return H.parse_vm_stat(out)
+        except Exception:
+            return {}
+
+    def swap_used_mb(self) -> float | None:
+        return H.parse_swap_used_mb(H._run_text(["sysctl", "vm.swapusage"]))
+
+    def pressure_level(self) -> int | None:
+        return H.parse_pressure_level(H._run_text(["sysctl", "-n", "kern.memorystatus_vm_pressure_level"]))
+
+
+class Phase:
+    """The child's current stage: the main thread sets it, the tracer reads it."""
+
+    def __init__(self, name: str = "init"):
+        self.name = name
+
+    def set(self, name: str) -> None:
+        self.name = name
+
+
+def _set_phase(instrument, name: str) -> None:
+    phase = getattr(instrument, "phase", None)
+    if phase is not None:
+        phase.set(name)
+
+
+class MemoryTracer:
+    """One row a second of what memory is doing, and the child's own stop rule.
+
+    A row has the phase, MLX active/cache/peak, process RSS, memory macOS could
+    reuse, the compressor, swap, the pressure level, the swap and compression
+    counters and the expert pool. Every row is flushed to a JSONL file as it is
+    written, so the file survives the kill that a pressure stop causes. ``event``
+    adds a row between samples (the expert pool being created, for example).
+
+    ``guard`` returns a stop reason from a row (``prefill_memory_harness.guard_reason``).
+    On a reason the tracer writes it, then calls ``on_guard`` (the child exits with
+    ``GUARD_EXIT_CODE``). ``step`` is one sample, so tests need no thread.
+    """
+
+    FAST_PHASES = ("feed", "prefill", "ring-acquire", "ring-release", "post-prefill")
+
+    def __init__(self, probe, path, *, interval: float = 1.0, phase=None, store=None,
+                 guard=None, on_guard=None, metal_limit=None, fast_interval: float | None = None,
+                 compressor_warn_mib: float | None = None,
+                 clock=time.monotonic, sleep=time.sleep):
+        self.probe, self.path, self.interval = probe, Path(path), interval
+        # During prefill the tracer samples every ``fast_interval`` seconds with the cheap readings
+        # only (MLX, one vm_stat read: about 2 ms); RSS, swap and pressure keep the ``interval`` cadence.
+        self.fast_interval = fast_interval
+        self.compressor_warn_mib = compressor_warn_mib
+        self._warned = False
+        self._last_full: float | None = None
+        self.phase = phase or Phase()
+        self.store, self.guard, self.metal_limit = store, guard, metal_limit
+        self.on_guard = on_guard or (lambda reason: os._exit(H.GUARD_EXIT_CODE))
+        self.clock, self.sleep = clock, sleep
+        self.rows: list = []
+        self.guard_reason: str | None = None
+        self._origin = clock()
+        self.compressor_start_mb: float | None = None   # the arm's own baseline: its first reading
+        self._stop = threading.Event()
+        self._thread = None
+        self._lock = threading.Lock()
+        self._file = None
+
+    def _write(self, row: dict) -> None:
+        with self._lock:
+            self.rows.append(row)
+            if self._file is None:
+                self.path.parent.mkdir(parents=True, exist_ok=True)
+                self._file = self.path.open("a", buffering=1)
+            self._file.write(json.dumps(row, separators=(",", ":")) + "\n")
+            self._file.flush()
+
+    def event(self, name: str, **fields) -> None:
+        self._write({"t": round(self.clock() - self._origin, 2), "event": name,
+                     "phase": None, "during": self.phase.name, **fields})
+
+    def _read(self, call, default=None):
+        try:
+            return call()
+        except Exception:
+            return default
+
+    def step(self, full: bool = True) -> dict:
+        now = self.clock()
+        if full:
+            self._last_full = now
+        mem = self._read(self.probe.memory, {})
+        machine = self._read(self.probe.machine, {})
+        counters = machine.get("counters", {})
+        pool = self._read(lambda: pool_state(self.store), {"exists": None})
+        compressor = machine.get("compressor_mb")
+        if compressor is not None and self.compressor_start_mb is None:
+            self.compressor_start_mb = compressor
+        growth = (None if compressor is None or self.compressor_start_mb is None
+                  else round(compressor - self.compressor_start_mb, 1))
+        row = {
+            "t": round(self.clock() - self._origin, 2), "phase": self.phase.name,
+            "mlx_active": mem.get("active"), "mlx_cache": mem.get("cache"), "mlx_peak": mem.get("peak"),
+            "rss": self._read(self.probe.rss_bytes) if full else None,
+            "available_mb": machine.get("available_mb"), "compressor_mb": compressor, "compressor_growth_mb": growth,
+            "file_backed_mb": machine.get("file_backed_mb"), "anonymous_mb": machine.get("anonymous_mb"),
+            "swap_used_mb": self._read(self.probe.swap_used_mb) if full else None,
+            "pressure_level": self._read(self.probe.pressure_level) if full else None,
+            "swapin": counters.get("swapin"), "swapout": counters.get("swapout"),
+            "compress": counters.get("compress"), "decompress": counters.get("decompress"),
+            "pagein": counters.get("pagein"),
+            "pool": pool,
+        }
+        if not full:
+            row["fast"] = True
+        self._write(row)
+        if (self.compressor_warn_mib is not None and growth is not None
+                and growth > self.compressor_warn_mib and not self._warned):
+            self._warned = True        # a warning is recorded, with the phase it happened in
+            self.event("compressor_warning", growth_mb=growth, limit_mb=self.compressor_warn_mib,
+                       available_mb=machine.get("available_mb"))
+        if self.guard is not None:
+            reason = self.guard({**row, "mlx_active": row["mlx_active"] or 0,
+                                 "mlx_cache": row["mlx_cache"] or 0,
+                                 "metal_limit_bytes": self.metal_limit})
+            if reason and self.guard_reason is None:
+                self.guard_reason = reason
+                self._write({"t": row["t"], "phase": None, "guard": reason, "during": row["phase"]})
+                self.on_guard(reason)
+        return row
+
+    def _run(self) -> None:
+        while not self._stop.is_set():
+            fast = (self.fast_interval is not None and self.phase.name in self.FAST_PHASES)
+            due = (self._last_full is None or self.clock() - self._last_full >= self.interval)
+            self.step(full=(not fast) or due)
+            self.sleep(self.fast_interval if fast else self.interval)
+
+    def start(self) -> None:
+        self._thread = threading.Thread(target=self._run, name="memory-tracer", daemon=True)
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=max(2.0, 2 * self.interval))
+        with self._lock:
+            if self._file is not None:
+                self._file.close()
+                self._file = None
+
+
+def make_reads_uncached(store) -> int:
+    """TEST-ONLY control: ``F_NOCACHE`` on every shard descriptor the store reads experts through.
+
+    The production baseline reads experts through buffered descriptors, so every row passes
+    through the file cache. This puts the same reads on uncached descriptors (as the expert
+    pool and the ring already do) and changes nothing else: the same store, the same read
+    mode, no pool, no ring. It patches the instance in this benchmark process only. Returns
+    how many descriptors were already open (later ones are set as they are opened).
+
+    Every descriptor it sets is remembered in ``store._uncached_applied``; ``uncached_report``
+    compares that with the descriptors the store actually holds, because Python cannot read
+    the flag back. ``fcntl`` raises if the OS refuses, so a descriptor in the set was accepted.
+    """
+    import fcntl
+
+    applied: set = set()
+
+    def mark(fd):
+        fcntl.fcntl(fd, fcntl.F_NOCACHE, 1)
+        applied.add(fd)
+
+    for fd in list(store._fds.values()):
+        mark(fd)
+    original = store._fd
+
+    def _fd(shard):
+        known = shard in store._fds
+        fd = original(shard)
+        if not known:
+            mark(fd)
+        return fd
+
+    store._fd = _fd
+    store._uncached_applied = applied
+    return len(store._fds)
+
+
+def uncached_report(store) -> dict:
+    """Which of the store's shard descriptors had ``F_NOCACHE`` applied (none unprotected = verified)."""
+    applied = getattr(store, "_uncached_applied", set())
+    held = dict(getattr(store, "_fds", {}))
+    return {"descriptors": len(held), "applied": len([fd for fd in held.values() if fd in applied]),
+            "unprotected": sorted(shard for shard, fd in held.items() if fd not in applied),
+            "shards": sorted(held)}
+
 
 def find_store(language):
     """The checkpoint store the streamed layers share, or None."""
@@ -128,10 +330,13 @@ class Instrument:
     so scratch cleanup (G4) is judged on the state the decode pool will see.
     """
 
-    def __init__(self, probe, prefill_module, ring_module, language):
+    def __init__(self, probe, prefill_module, ring_module, language, phase=None, events=None):
         self.probe, self.prefill, self.ring = probe, prefill_module, ring_module
         self.language = language
+        self.phase = phase if phase is not None else Phase()
+        self.events = events          # ``MemoryTracer.event`` or None
         self._saved = {}
+        self._pool_init = None
         self.reset()
 
     def reset(self) -> None:
@@ -156,7 +361,11 @@ class Instrument:
             record = {"tokens": int(ids.shape[1]),
                       "before": {**before, "pool_exists": pool_state(store)["exists"]}}
             began = instrument.probe.now()
-            result = original["target"](language, ids, cache, *args, **kwargs)
+            _set_phase(instrument, "prefill")
+            try:
+                result = original["target"](language, ids, cache, *args, **kwargs)
+            finally:
+                _set_phase(instrument, "post-prefill")
             record["seconds"] = instrument.probe.now() - began
             after = instrument._seen(instrument.probe.memory())
             record["after"] = {**after, "pool_exists": pool_state(store)["exists"],
@@ -167,7 +376,12 @@ class Instrument:
         def acquire(language, tokens):
             faults = instrument.probe.faults()
             began = instrument.probe.now()
-            state = original["acquire"](language, tokens)
+            before_phase = instrument.phase.name
+            _set_phase(instrument, "ring-acquire")
+            try:
+                state = original["acquire"](language, tokens)
+            finally:
+                _set_phase(instrument, before_phase)
             instrument.acquire_s = (instrument.acquire_s or 0.0) + instrument.probe.now() - began
             instrument.acquire_faults = {
                 key: instrument.probe.faults()[key] - faults[key] for key in faults
@@ -180,19 +394,43 @@ class Instrument:
             if state is not None:
                 instrument.ring_stats = dict(state.stats())
             began = instrument.probe.now()
-            original["release"](state, failed)
+            before_phase = instrument.phase.name
+            _set_phase(instrument, "ring-release")
+            try:
+                original["release"](state, failed)
+            finally:
+                _set_phase(instrument, before_phase)
             if state is not None:
                 instrument.dispose_s = (instrument.dispose_s or 0.0) + instrument.probe.now() - began
 
         self.prefill.prefill_target = prefill_target
         self.ring.acquire = acquire
         self.ring.release = release
+        if self.events is not None:
+            # Observe pool creation (the decode pool and the scratch pool both pass here).
+            from models.flashnext import expert_pool
+
+            original_init = expert_pool.ExpertPool.__init__
+            self._pool_init = original_init
+
+            def pool_init(pool, store, size_bytes, *args, **kwargs):
+                instrument.events("expert_pool_creating", size_bytes=int(size_bytes))
+                original_init(pool, store, size_bytes, *args, **kwargs)
+                instrument.events("expert_pool_created", slots=getattr(pool, "slots", None),
+                                  mapped_bytes=len(getattr(pool, "_mm", b"")))
+
+            expert_pool.ExpertPool.__init__ = pool_init
         return self
 
     def __exit__(self, *exc):
         self.prefill.prefill_target = self._saved["target"]
         self.ring.acquire = self._saved["acquire"]
         self.ring.release = self._saved["release"]
+        if self._pool_init is not None:
+            from models.flashnext import expert_pool
+
+            expert_pool.ExpertPool.__init__ = self._pool_init
+            self._pool_init = None
         return False
 
 
@@ -221,6 +459,7 @@ def kv_digest(cache) -> str:
 def run_turn(backend, probe, instrument, store, name: str, feed, decode: int,
              hasher=kv_digest) -> dict:
     """Feed one turn, prefill it, decode, and return every measurement."""
+    _set_phase(instrument, "feed")
     feed()
     pending = len(backend.pending)
     instrument.reset()
@@ -232,6 +471,7 @@ def run_turn(backend, probe, instrument, store, name: str, feed, decode: int,
     marks, stamps = {}, []
 
     def on_prefilled():
+        _set_phase(instrument, "decode")
         marks["time"] = probe.now()
         marks["mem"] = probe.memory()
         marks["vm"], marks["disk"] = probe.vm(), probe.disk_bytes()
@@ -246,6 +486,7 @@ def run_turn(backend, probe, instrument, store, name: str, feed, decode: int,
             marks["first_token"] = int(value)
 
     _text, stats = backend.generate(decode, on_prefilled=on_prefilled, on_decode_token=on_token)
+    _set_phase(instrument, "turn-end")
     end_mem = probe.memory()
     ids = list(backend.tape[-stats.tokens:]) if stats.tokens else []
     prefilled = sum(call["tokens"] for call in instrument.calls)
@@ -293,24 +534,31 @@ def run_turn(backend, probe, instrument, store, name: str, feed, decode: int,
 
 def run_scenario(backend, probe, instrument, store, cond: H.Condition, prompts: dict,
                  decode: int, environ, flags: dict | None = None,
-                 hasher=kv_digest) -> list[dict]:
+                 hasher=kv_digest, extra: dict | None = None) -> list[dict]:
     """First-turn: apply the condition, measure turn 1. Second-turn: run turn 1
     under the baseline flags as setup, apply the condition, measure turn 2."""
     turns = []
+
+    def overlay(condition):
+        # ``extra`` (diagnostic overrides) goes on after the overlay, which unsets every
+        # managed flag; otherwise an override of one of them would be wiped out.
+        H.apply_overlay(environ, H.condition_overlay(condition, flags))
+        H.apply_overlay(environ, extra or {})
+
     if cond.turn == "second":
-        H.apply_overlay(environ, H.condition_overlay(H.CONDITIONS["S0"], flags))
+        overlay(H.ALL_CONDITIONS["S0"])
         turns.append(run_turn(
             backend, probe, instrument, store, "setup",
             lambda: backend.open_conversation(prompts["system"], prompts["first"],
                                               enable_thinking=False),
             decode, hasher))
-        H.apply_overlay(environ, H.condition_overlay(cond, flags))
+        overlay(cond)
         turns.append(run_turn(
             backend, probe, instrument, store, "measured",
             lambda: backend.append_user(prompts["later"], enable_thinking=False),
             decode, hasher))
     else:
-        H.apply_overlay(environ, H.condition_overlay(cond, flags))
+        overlay(cond)
         turns.append(run_turn(
             backend, probe, instrument, store, "measured",
             lambda: backend.open_conversation(prompts["system"], prompts["first"],
@@ -320,12 +568,22 @@ def run_scenario(backend, probe, instrument, store, cond: H.Condition, prompts: 
 
 
 def child_main(args) -> int:
-    cond = H.CONDITIONS[args.condition]
+    cond = H.ALL_CONDITIONS[args.condition]
     H.apply_overlay(os.environ, H.launch_overlay(cond))
     from models.flashnext.settings.launch import apply_chat_environment
 
     apply_chat_environment(os.environ)
     os.environ["FLASHNEXT_GPU_KEEPWARM"] = "0"
+    # Diagnostic overrides, applied on top of the production chat environment and recorded
+    # in the arm's evidence. The Q4 weights and the routing are never touched.
+    pool_gb = getattr(args, "expert_pool_gb", None)
+    ring_min = getattr(args, "ring_min_tokens", None)
+    if pool_gb is not None:
+        os.environ["FLASHNEXT_EXPERT_POOL_GB"] = f"{pool_gb:g}"
+    from models.flashnext import prefill_ring as _ring_flags
+
+    extra = {} if ring_min is None else {_ring_flags.FLAG_MIN_TOKENS: str(ring_min)}
+    H.apply_overlay(os.environ, extra)
     target = output_path("flashnext", "prefill-memory", f"arm-{args.condition}.json", args.json)
     pins = target.parent / "pins"
     pins.mkdir(exist_ok=True)
@@ -333,6 +591,41 @@ def child_main(args) -> int:
     for item in list(source.glob("pins.json")) + list(source.glob("slab-frozen-*.json")):
         shutil.copy2(item, pins / item.name)
     os.environ["FLASHNEXT_PIN_CACHE"] = str(pins / "pins.json")
+
+    probe = RealProbe()
+    phase = Phase("load")
+    trace_path = target.parent / f"{target.stem}.trace.jsonl"
+    min_available = getattr(args, "min_available_gb", H.MIN_AVAILABLE_GB)
+    compressor_gib = getattr(args, "max_compressor_growth_gib", H.MAX_COMPRESSOR_GROWTH_GIB)
+    state = {"evidence": None, "store": None, "uncached": False}
+
+    def leave(reason: str) -> None:
+        """The child's own stop: say why in the arm file (the trace already has the row), then
+        exit at once. Nothing is left to clean up: the pools are anonymous memory and the
+        descriptors are closed by the exit."""
+        try:
+            last = next((row for row in reversed(tracer.rows) if row.get("phase") is not None), None)
+            target.write_text(json.dumps({
+                "status": "guard_stop", "reason": reason, "classification": "resource_stop",
+                "phase": (last or {}).get("phase"), "last_sample": last,
+                "trace_file": trace_path.name, "evidence": state["evidence"],
+                "uncached_reads": uncached_report(state["store"]) if state["uncached"] else None},
+                indent=1) + "\n")
+        except Exception:
+            pass
+        finally:
+            os._exit(H.GUARD_EXIT_CODE)
+
+    fast_interval = getattr(args, "fast_trace_interval", H.FAST_TRACE_SECONDS)
+    stop_available_gib = getattr(args, "compressor_stop_available_gib", H.COMPRESSOR_STOP_AVAILABLE_GIB)
+    tracer = MemoryTracer(
+        probe, trace_path, interval=getattr(args, "trace_interval", 1.0), phase=phase,
+        metal_limit=probe.metal_limit(), on_guard=leave,
+        fast_interval=fast_interval or None, compressor_warn_mib=compressor_gib * 1024,
+        guard=lambda row: H.guard_reason(row, min_available_gb=min_available,
+                                         compressor_limit_mib=compressor_gib * 1024,
+                                         compressor_stop_available_mib=stop_available_gib * 1024))
+    tracer.start()          # before the model loads, so the load is traced too
 
     from macqwen.backends.flashnext import FlashNextBackend
     from macqwen.checkpoints import resolve_flashnext
@@ -342,28 +635,53 @@ def child_main(args) -> int:
 
     checkpoint = str(resolve_flashnext(os.environ.get("MACQWEN_FLASHNEXT_MODEL")))
     resident = resolve_resident_experts(None, checkpoint) or 32
-    probe = RealProbe()
     backend = FlashNextBackend(model_path=checkpoint, resident_experts=resident)
     store = find_store(backend.language)
-    prompts = H.build_prompts(backend.tokenizer, SOURCE_TEXT.read_text(), H.SIZES[args.size])
+    tracer.store = store
+    uncached = make_reads_uncached(store) if cond.uncached_reads and store is not None else None
+    state["store"], state["uncached"] = store, uncached is not None
+    if uncached is not None:
+        tracer.event("uncached_reads_applied", **uncached_report(store))
+    phase.set("prompts")
+    prompts = H.build_prompts(backend.tokenizer, SOURCE_TEXT.read_text(), H.ALL_SIZES[args.size])
     evidence = {
         "arm_id": args.arm_id or f"{args.size}-{args.condition}", "size": args.size,
         "turn": cond.turn, "condition": args.condition, "round": args.round,
         "reverse": args.reverse, "checkpoint": checkpoint,
         "checkpoint_identity": checkpoint_identity_for_store(store) if store else None,
         "metal_limit_bytes": probe.metal_limit(),
+        "diagnostic_overrides": {"expert_pool_gb": pool_gb, "ring_min_tokens": ring_min,
+                                 "min_available_gb": min_available,
+                                 "max_compressor_growth_gib": compressor_gib,
+                                 "compressor_stop_available_gib": stop_available_gib,
+                                 "trace_interval_s": tracer.interval,
+                                 "fast_trace_interval_s": fast_interval},
         "prompts": {key: prompts[key] for key in
                     ("source_hash", "first_hash", "later_hash", "first_ids", "later_ids")},
         "after_load": {**probe.memory(), "rss": probe.rss_bytes(),
                        "pool": pool_state(store)},
         "environment": {k: os.environ.get(k) for k in sorted(os.environ)
                         if k.startswith("FLASHNEXT_")},
+        "trace_file": trace_path.name,
+        "uncached_reads": None if uncached is None else {"descriptors_open_at_start": uncached},
         "status": "running", "turns": [],
     }
+    state["evidence"] = evidence
     target.write_text(json.dumps(evidence, indent=1) + "\n")
-    with Instrument(probe, prefill, prefill_ring, backend.language) as instrument:
+    with Instrument(probe, prefill, prefill_ring, backend.language,
+                    phase=phase, events=tracer.event) as instrument:
         evidence["turns"] = run_scenario(
-            backend, probe, instrument, store, cond, prompts, args.decode, os.environ)
+            backend, probe, instrument, store, cond, prompts, args.decode, os.environ,
+            extra=extra)
+    phase.set("done")
+    if uncached is not None:
+        report = uncached_report(store)
+        tracer.event("uncached_reads_final", **report)
+        evidence["uncached_reads"] = {"descriptors_open_at_start": uncached, **report,
+                                      "verified": report["descriptors"] > 0 and not report["unprotected"]}
+    tracer.step()
+    tracer.stop()
+    evidence["trace"] = {"file": trace_path.name, **H.summarize_trace(tracer.rows)}
     evidence["status"] = "completed"
     target.write_text(json.dumps(evidence, indent=1) + "\n")
     print(f"wrote {target}", flush=True)
@@ -431,7 +749,7 @@ def prompt_sizes(tokenizer, sizes: list[str], source: str) -> list[dict]:
 
     rows = []
     for size in sizes:
-        target = H.SIZES[size]
+        target = H.ALL_SIZES[size]
         prompts = H.build_prompts(tokenizer, source, target)
         conversation = Conversation(tokenizer)
         first = conversation.open_conversation(prompts["system"], prompts["first"], enable_thinking=False)
@@ -486,9 +804,12 @@ def check_ready(args, *, sampler=None, preflight_module=None, tokenizer_loader=N
             report.add("prompt sizes", pf.FAIL, f"{type(error).__name__}: {error}")
     else:
         report.add("prompt sizes", pf.SKIP, "needs a READY checkpoint (tokenizer files)")
-    sampler = sampler or H.Sampler(vm=_vm_counters, load=lambda: os.getloadavg()[0])
+    sampler = sampler or H.Sampler(vm=_vm_counters, load=lambda: os.getloadavg()[0],
+                                   memory=_memory_reading)
     sample = sampler.sample()
-    reason = H.Watchdog(H.SafetyPolicy(final=bool(getattr(args, "final", False))), sample).check(sample)
+    reason = H.Watchdog(H.SafetyPolicy(
+        final=bool(getattr(args, "final", False)),
+        min_available_gb=getattr(args, "min_available_gb", H.MIN_AVAILABLE_GB)), sample).check(sample)
     report.add("machine state", pf.FAIL if reason else pf.PASS,
                reason or f"battery {sample.get('battery_percent')}% on {sample.get('power_source')}, "
                          f"Low Power Mode {sample.get('low_power')}, pressure level {sample.get('pressure_level')}, "
@@ -504,6 +825,21 @@ def check_ready(args, *, sampler=None, preflight_module=None, tokenizer_loader=N
     report.add("environment", pf.WARN if leaked else pf.PASS,
                f"set in this shell, overriding the production chat defaults: {sorted(leaked)}" if leaked
                else "no FLASHNEXT_* variables set in this shell (the baseline is the production chat environment)")
+    overrides = diagnostic_overrides(args)
+    active = {k: v for k, v in overrides.items() if k in ("expert_pool_gb", "ring_min_tokens") and v is not None}
+    if active:
+        report.add("diagnostic overrides", pf.INFO,
+                   f"{active}: decode pool and ring threshold only; Q4 weights and routing are unchanged; "
+                   f"the child stops below {overrides['min_available_gb']:g} GB available memory",
+                   **overrides)
+    ring_floor = overrides["ring_min_tokens"] if overrides["ring_min_tokens"] is not None else PRODUCTION_RING_MIN_TOKENS
+    if any(H.ALL_CONDITIONS[name].ring_on for name in args.conditions):
+        short = [size for size in args.sizes if H.ALL_SIZES[size] < ring_floor]
+        report.add("ring activation", pf.WARN if short else pf.PASS,
+                   (f"prompts of {short} are shorter than the ring minimum ({ring_floor} tokens): the ring will "
+                    f"report 'short prompt' and not activate, so an F0-versus-F2 comparison would compare nothing. "
+                    f"Pass --ring-min-tokens to lower it for a diagnostic run; the memory guard stays on")
+                   if short else f"every size is at least the ring minimum ({ring_floor} tokens)")
     arms = H.build_schedule(args.sizes, args.conditions, args.rounds)
     speed_ok = args.rounds >= H.MIN_ROUNDS_FOR_EFFECT
     report.add("cache warming", pf.INFO if speed_ok else pf.WARN,
@@ -537,11 +873,56 @@ def _free_memory_gb():
 
 # -- orchestrator -------------------------------------------------------------
 
-def child_command(arm: H.Arm, decode: int, result: Path) -> list[str]:
+def child_command(arm: H.Arm, decode: int, result: Path, extra: list[str] | None = None) -> list[str]:
     return [sys.executable, "-m", MODULE, "--child", "--size", arm.size,
             "--condition", arm.condition, "--decode", str(decode),
             "--arm-id", arm.arm_id, "--round", str(arm.round + 1),
-            "--json", str(result)] + (["--reverse"] if arm.reverse else [])
+            "--json", str(result)] + (["--reverse"] if arm.reverse else []) + list(extra or [])
+
+
+def diagnostic_args(args) -> list[str]:
+    """The options the children need beyond the arm itself."""
+    out = ["--min-available-gb", f"{getattr(args, 'min_available_gb', H.MIN_AVAILABLE_GB):g}",
+           "--max-compressor-growth-gib",
+           f"{getattr(args, 'max_compressor_growth_gib', H.MAX_COMPRESSOR_GROWTH_GIB):g}",
+           "--compressor-stop-available-gib",
+           f"{getattr(args, 'compressor_stop_available_gib', H.COMPRESSOR_STOP_AVAILABLE_GIB):g}",
+           "--trace-interval", f"{getattr(args, 'trace_interval', 1.0):g}",
+           "--fast-trace-interval", f"{getattr(args, 'fast_trace_interval', H.FAST_TRACE_SECONDS):g}"]
+    if getattr(args, "expert_pool_gb", None) is not None:
+        out += ["--expert-pool-gb", f"{args.expert_pool_gb:g}"]
+    if getattr(args, "ring_min_tokens", None) is not None:
+        out += ["--ring-min-tokens", str(args.ring_min_tokens)]
+    return out
+
+
+def diagnostic_overrides(args) -> dict:
+    return {"expert_pool_gb": getattr(args, "expert_pool_gb", None),
+            "ring_min_tokens": getattr(args, "ring_min_tokens", None),
+            "min_available_gb": getattr(args, "min_available_gb", H.MIN_AVAILABLE_GB),
+            "max_compressor_growth_gib": getattr(args, "max_compressor_growth_gib",
+                                                 H.MAX_COMPRESSOR_GROWTH_GIB),
+            "compressor_stop_available_gib": getattr(args, "compressor_stop_available_gib",
+                                                     H.COMPRESSOR_STOP_AVAILABLE_GIB),
+            "trace_interval_s": getattr(args, "trace_interval", 1.0),
+            "fast_trace_interval_s": getattr(args, "fast_trace_interval", H.FAST_TRACE_SECONDS)}
+
+
+def _available_mb() -> float | None:
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+        return H.parse_vm_stat(out)["available_mb"]
+    except Exception:
+        return None
+
+
+def _memory_reading() -> dict:
+    """Available memory, compressor size and page cache from one ``vm_stat`` read."""
+    try:
+        out = subprocess.run(["vm_stat"], capture_output=True, text=True, timeout=5).stdout
+        return H.parse_vm_stat(out)
+    except Exception:
+        return {}
 
 
 def child_environment(base: dict, cond: H.Condition, flags: dict | None = None) -> dict:
@@ -551,7 +932,7 @@ def child_environment(base: dict, cond: H.Condition, flags: dict | None = None) 
 def describe_schedule(arms: list[H.Arm], decode: int, flags: dict | None = None) -> list[str]:
     lines = []
     for arm in arms:
-        cond = H.CONDITIONS[arm.condition]
+        cond = H.ALL_CONDITIONS[arm.condition]
         overlay = {k: v for k, v in H.launch_overlay(cond, flags).items() if v is not None}
         later = {k: v for k, v in H.condition_overlay(cond, flags).items() if v is not None}
         lines.append(
@@ -573,7 +954,7 @@ def validate_arms(arms: list[dict]) -> dict:
     by_id = {(a["size"], a["condition"], a["round"]): a for a in arms}
     report = {"exactness": H.exactness(arms), "arms": {}, "decode": H.decode_regression(arms)}
     for arm in arms:
-        cond = H.CONDITIONS[arm["condition"]]
+        cond = H.ALL_CONDITIONS[arm["condition"]]
         base = by_id.get((arm["size"], H.BASELINES[cond.turn], arm["round"]))
         report["arms"][arm["arm_id"]] = {
             "G2": H.ring_health(arm, cond),
@@ -587,8 +968,14 @@ def orchestrate(args, sampler=None, popen=subprocess.Popen, sleep=time.sleep) ->
     from macqwen.measurement import MeasurementRun
 
     arms = H.build_schedule(args.sizes, args.conditions, args.rounds)
-    sampler = sampler or H.Sampler(vm=_vm_counters, load=lambda: os.getloadavg()[0])
-    policy = H.SafetyPolicy(final=args.final)
+    sampler = sampler or H.Sampler(vm=_vm_counters, load=lambda: os.getloadavg()[0],
+                                   memory=_memory_reading)
+    policy = H.SafetyPolicy(
+        final=args.final, min_available_gb=getattr(args, "min_available_gb", H.MIN_AVAILABLE_GB),
+        compressor_limit_mib=getattr(args, "max_compressor_growth_gib",
+                                     H.MAX_COMPRESSOR_GROWTH_GIB) * 1024,
+        compressor_stop_available_mib=getattr(args, "compressor_stop_available_gib",
+                                              H.COMPRESSOR_STOP_AVAILABLE_GIB) * 1024)
     start = sampler.sample()
     watchdog = H.Watchdog(policy, start)
     refusal = watchdog.check(start)
@@ -598,6 +985,9 @@ def orchestrate(args, sampler=None, popen=subprocess.Popen, sleep=time.sleep) ->
         "preliminary": not args.final or start.get("power_source") != "ac",
         "environment_at_start": start, "sizes": args.sizes, "conditions": args.conditions,
         "rounds": args.rounds, "decode_tokens": args.decode,
+        "diagnostic_overrides": diagnostic_overrides(args),
+        "diagnostic": any(getattr(args, name, None) is not None
+                          for name in ("expert_pool_gb", "ring_min_tokens")),
         "schedule": [a.arm_id for a in arms], "sources": fingerprints(),
         "sampler": "greedy; closed thinking block",
         "speed_evidence": args.rounds >= H.MIN_ROUNDS_FOR_EFFECT,
@@ -617,7 +1007,7 @@ def orchestrate(args, sampler=None, popen=subprocess.Popen, sleep=time.sleep) ->
     for arm in arms:
         if arm.size in skipped_sizes:
             continue
-        cond = H.CONDITIONS[arm.condition]
+        cond = H.ALL_CONDITIONS[arm.condition]
         if current is not None and arm.size != current:
             worst = H.worst_headroom(finished, current)
             if worst is not None and worst < H.NEXT_SIZE_HEADROOM_BYTES:
@@ -641,18 +1031,26 @@ def orchestrate(args, sampler=None, popen=subprocess.Popen, sleep=time.sleep) ->
             print(f"stopped before {arm.arm_id}: {reason}", flush=True)
             return 3
         result_path = output_path("flashnext", "prefill-memory", f"arm-{arm.arm_id}.json")
-        command = child_command(arm, args.decode, result_path)
+        command = child_command(arm, args.decode, result_path, diagnostic_args(args))
         outcome = H.run_child(
             command, child_environment(dict(os.environ), cond), sampler=sampler,
-            watchdog=watchdog, vm_start=pre.get("vm"), interval=args.interval,
+            watchdog=watchdog, vm_start=pre.get("vm"), arm_start=pre, interval=args.interval,
             timeout=H.TIME_LIMIT_SECONDS[arm.size], popen=popen, sleep=sleep)
         post = sampler.sample()
         if outcome.status != "ok":
+            # A stop on a memory rule is a diagnostic stop, not a correctness failure: no
+            # output was compared, so nothing is known about exactness for this arm.
+            resource_stop = outcome.status in ("stopped", "memory_guard", "exit_137")
             run.failure(outcome.message, arm_id=arm.arm_id, error_type=outcome.status,
-                        returncode=outcome.returncode, before=pre, after=post)
-            if outcome.status in ("stopped", "timeout", "exit_137"):
-                run.finish("stopped", reason=outcome.message, completed_arms=len(finished))
-                print(f"stopped at {arm.arm_id}: {outcome.message}", flush=True)
+                        classification="resource_stop" if resource_stop else outcome.status,
+                        returncode=outcome.returncode, before=pre, after=post,
+                        watchdog=H.trace_summary(outcome.trace),
+                        child_trace=_child_trace_summary(result_path))
+            if outcome.status in ("stopped", "timeout", "exit_137", "memory_guard"):
+                run.finish("stopped", reason=outcome.message, completed_arms=len(finished),
+                           classification="resource_stop" if resource_stop else outcome.status)
+                kind = " (diagnostic stop, not a correctness failure)" if resource_stop else ""
+                print(f"stopped at {arm.arm_id}: {outcome.message}{kind}", flush=True)
                 return 3
             continue
         data = json.loads(result_path.read_text())
@@ -662,7 +1060,8 @@ def orchestrate(args, sampler=None, popen=subprocess.Popen, sleep=time.sleep) ->
                 command=command, metrics=_arm_metrics(data), size=arm.size,
                 turn=cond.turn, reverse=arm.reverse, order_index=arm.index,
                 environment_before=pre, environment_after=post,
-                samples=len(outcome.samples), result_file=str(result_path.name))
+                samples=len(outcome.samples), result_file=str(result_path.name),
+                watchdog=H.trace_summary(outcome.trace))
         print(f"{arm.arm_id}: done", flush=True)
         sleep(args.settle)
     report = validate_arms(finished)
@@ -682,7 +1081,17 @@ def orchestrate(args, sampler=None, popen=subprocess.Popen, sleep=time.sleep) ->
     return 0
 
 
-SIZE_ORDER = {name: index for index, name in enumerate(sorted(H.SIZES, key=H.SIZES.get))}
+SIZE_ORDER = {name: index for index, name in enumerate(sorted(H.ALL_SIZES, key=H.ALL_SIZES.get))}
+
+
+def _child_trace_summary(result_path: Path) -> dict | None:
+    """Per-phase extremes from the child's own 1 s trace file, if it wrote one."""
+    path = result_path.parent / f"{result_path.stem}.trace.jsonl"
+    try:
+        rows = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    except (OSError, ValueError):
+        return None
+    return {"file": path.name, **H.summarize_trace(rows)}
 
 
 def _vm_counters() -> dict:
@@ -712,8 +1121,8 @@ def _arm_metrics(data: dict) -> dict:
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__,
                                      formatter_class=argparse.RawDescriptionHelpFormatter)
-    parser.add_argument("--sizes", nargs="+", choices=sorted(H.SIZES), default=["1k"])
-    parser.add_argument("--conditions", nargs="+", choices=sorted(H.CONDITIONS),
+    parser.add_argument("--sizes", nargs="+", choices=sorted(H.ALL_SIZES, key=H.ALL_SIZES.get), default=["1k"])
+    parser.add_argument("--conditions", nargs="+", choices=sorted(H.ALL_CONDITIONS),
                         default=list(H.CONDITIONS))
     parser.add_argument("--rounds", type=int, default=3)
     parser.add_argument("--decode", type=int, default=H.DECODE_TOKENS)
@@ -728,11 +1137,30 @@ def main(argv=None) -> int:
                              "starts nothing and writes nothing")
     parser.add_argument("--dry-run", action="store_true",
                         help="print the schedule and flags; start nothing, write nothing")
+    parser.add_argument("--expert-pool-gb", type=float, default=None,
+                        help="diagnostic: size of the decode expert pool in GB instead of the production "
+                             "chat default (6). Q4 weights and routing are unchanged")
+    parser.add_argument("--ring-min-tokens", type=int, default=None,
+                        help="diagnostic: the shortest prompt the ring may serve (production: 512), "
+                             "so a short-prompt F2 arm can activate. The memory guard still applies")
+    parser.add_argument("--min-available-gb", type=float, default=H.MIN_AVAILABLE_GB,
+                        help="stop when memory macOS could reuse falls below this (default %(default)s)")
+    parser.add_argument("--max-compressor-growth-gib", type=float, default=H.MAX_COMPRESSOR_GROWTH_GIB,
+                        help="stop when the compressor grows by this much within one arm, measured "
+                             "from the arm's own start (default %(default)s)")
+    parser.add_argument("--compressor-stop-available-gib", type=float, default=H.COMPRESSOR_STOP_AVAILABLE_GIB,
+                        help="compressor growth over its limit only stops an arm when available memory is "
+                             "below this (default %(default)s); growth alone is a recorded warning")
+    parser.add_argument("--fast-trace-interval", type=float, default=H.FAST_TRACE_SECONDS,
+                        help="child sampling interval during prefill, cheap readings only; 0 = off "
+                             "(default %(default)s)")
+    parser.add_argument("--trace-interval", type=float, default=1.0,
+                        help="seconds between the child's memory trace rows (default %(default)s)")
     parser.add_argument("--record", help="measurement JSONL path (inside results/)")
     parser.add_argument("--json", help="child result path (inside results/)")
     parser.add_argument("--child", action="store_true", help=argparse.SUPPRESS)
-    parser.add_argument("--size", choices=sorted(H.SIZES), help=argparse.SUPPRESS)
-    parser.add_argument("--condition", choices=sorted(H.CONDITIONS), help=argparse.SUPPRESS)
+    parser.add_argument("--size", choices=sorted(H.ALL_SIZES), help=argparse.SUPPRESS)
+    parser.add_argument("--condition", choices=sorted(H.ALL_CONDITIONS), help=argparse.SUPPRESS)
     parser.add_argument("--arm-id", help=argparse.SUPPRESS)
     parser.add_argument("--round", type=int, default=1, help=argparse.SUPPRESS)
     parser.add_argument("--reverse", action="store_true", help=argparse.SUPPRESS)
@@ -751,9 +1179,10 @@ def main(argv=None) -> int:
     if args.dry_run:
         arms = H.build_schedule(args.sizes, args.conditions, args.rounds)
         print(f"{len(arms)} fresh-process arms; sizes {args.sizes}; rounds {args.rounds}")
+        print("diagnostic overrides:", diagnostic_overrides(args))
         print("\n".join(describe_schedule(arms, args.decode)))
         print("example command:", " ".join(
-            child_command(arms[0], args.decode, Path("<results>/arm.json"))))
+            child_command(arms[0], args.decode, Path("<results>/arm.json"), diagnostic_args(args))))
         return 0
     return orchestrate(args)
 

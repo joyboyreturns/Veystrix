@@ -318,10 +318,49 @@ class WatchdogTests(unittest.TestCase):
         self.assertIn("pressure", self.dog().check(good_sample(pressure_level=4)))
         self.assertIsNone(self.dog().check(good_sample(pressure_level=1)))
 
-    def test_swapping_stops(self):
-        self.assertIn("swapin", self.dog().check(good_sample(), {"swapin": 1, "swapout": 0}))
-        self.assertIn("swapout", self.dog().check(good_sample(), {"swapout": 3}))
+    PAGE = 16384                      # bytes per vm_stat page on Apple silicon
+    LIMIT_PAGES = 64 * 1024 * 1024 // PAGE   # 4096 pages is exactly 64 MiB
+
+    def test_swapout_always_stops(self):
+        self.assertIn("swapout", self.dog().check(good_sample(), {"swapout": 1}))
+        self.assertIn("swapout", self.dog().check(good_sample(), {"swapin": 0, "swapout": 3}))
         self.assertIsNone(self.dog().check(good_sample(), {"swapin": 0, "swapout": 0, "pageout": 9}))
+
+    def test_tiny_historical_swapin_does_not_stop(self):
+        # The first real run was stopped by a 4-page (64 KiB) swap-in.
+        dog = self.dog(page_bytes=self.PAGE)
+        self.assertIsNone(dog.check(good_sample(), {"swapin": 4, "swapout": 0}))
+        self.assertIsNone(dog.check(good_sample(), {"swapin": 1000, "swapout": 0}))
+
+    def test_swapin_up_to_64_mib_is_allowed_and_more_stops(self):
+        dog = self.dog(page_bytes=self.PAGE)
+        self.assertIsNone(dog.check(good_sample(), {"swapin": self.LIMIT_PAGES, "swapout": 0}))
+        reason = self.dog(page_bytes=self.PAGE).check(
+            good_sample(), {"swapin": self.LIMIT_PAGES + 1, "swapout": 0})
+        self.assertIn("swap-in", reason)
+        self.assertIn("64 MiB", reason)
+
+    def test_swapin_limit_uses_the_page_size(self):
+        # The same page count is four times the bytes on a 64 KiB-page system.
+        pages = self.LIMIT_PAGES // 2
+        self.assertIsNone(self.dog(page_bytes=self.PAGE).check(good_sample(), {"swapin": pages}))
+        self.assertIn("swap-in", self.dog(page_bytes=4 * self.PAGE).check(good_sample(), {"swapin": pages}))
+
+    def test_swapin_limit_is_configurable(self):
+        dog = self.dog(page_bytes=self.PAGE, swapin_limit_mib=1.0)
+        self.assertIn("swap-in", dog.check(good_sample(), {"swapin": 65}))
+
+    def test_swapin_alone_does_not_hide_pressure_or_swapout(self):
+        dog = self.dog(page_bytes=self.PAGE)
+        self.assertIn("pressure", dog.check(good_sample(pressure_level=2), {"swapin": 4}))
+        self.assertIn("swapout", dog.check(good_sample(), {"swapin": 4, "swapout": 1}))
+
+    def test_the_check_records_what_it_saw(self):
+        dog = self.dog(page_bytes=self.PAGE)
+        dog.check(good_sample(pressure_level=1, swap_used_mb=120.0), {"swapin": 512, "swapout": 0})
+        self.assertEqual(dog.last["swapin_mib"], 8.0)
+        self.assertEqual((dog.last["pressure_level"], dog.last["swap_used_mb"]), (1, 120.0))
+        self.assertEqual(dog.last["swapout_pages"], 0)
 
     def test_swap_growth_over_64_mb_stops(self):
         self.assertIn("swap grew", self.dog().check(good_sample(swap_used_mb=165.0)))
@@ -429,16 +468,45 @@ class RunChildTests(unittest.TestCase):
         self.assertEqual(result.status, "timeout")
         self.assertTrue(proc.terminated)
 
-    def test_swap_movement_since_the_arm_began_stops_the_child(self):
+    def child(self, vm, vm_start, polls=100):
         clock = Clock()
-        dog = H.Watchdog(H.SafetyPolicy(), good_sample())
-        sampler = SimpleNamespace(sample=lambda: good_sample(vm={"swapin": 10, "swapout": 0}))
-        proc = FakeProc(0, polls=100)
-        result = H.run_child(["x"], {}, timeout=600, sampler=sampler, watchdog=dog,
-                             vm_start={"swapin": 0, "swapout": 0}, popen=lambda c, env: proc,
-                             sleep=clock.sleep, clock=clock, grace=1.0)
+        dog = H.Watchdog(H.SafetyPolicy(page_bytes=16384), good_sample())
+        sampler = SimpleNamespace(sample=lambda: good_sample(vm=vm))
+        return H.run_child(["x"], {}, timeout=600, sampler=sampler, watchdog=dog,
+                           vm_start=vm_start, popen=lambda c, env: FakeProc(0, polls=polls),
+                           sleep=clock.sleep, clock=clock, grace=1.0)
+
+    def test_swapout_since_the_arm_began_stops_the_child(self):
+        result = self.child({"swapin": 0, "swapout": 10}, {"swapin": 0, "swapout": 0})
         self.assertEqual(result.status, "stopped")
-        self.assertIn("swapping", result.stop_reason)
+        self.assertIn("swapout", result.stop_reason)
+
+    def test_large_swapin_since_the_arm_began_stops_the_child(self):
+        result = self.child({"swapin": 5000, "swapout": 0}, {"swapin": 0, "swapout": 0})
+        self.assertEqual(result.status, "stopped")
+        self.assertIn("swap-in", result.stop_reason)
+
+    def test_tiny_swapin_does_not_stop_the_child_and_is_traced(self):
+        # Historical counters are huge; only growth since the arm's own start counts.
+        result = self.child({"swapin": 2_952_269, "swapout": 3_798_763},
+                            {"swapin": 2_952_265, "swapout": 3_798_763}, polls=3)
+        self.assertEqual(result.status, "ok")
+        summary = H.trace_summary(result.trace)
+        self.assertGreater(summary["samples"], 0)
+        self.assertAlmostEqual(summary["max_swapin_mib"], 4 * 16384 / 1048576, places=2)
+        self.assertEqual((summary["max_swapout_pages"], summary["max_pressure_level"]), (0, 1))
+
+    def test_a_stopped_child_still_carries_its_trace(self):
+        result = self.child({"swapin": 5000, "swapout": 0}, {"swapin": 0, "swapout": 0})
+        self.assertGreater(H.trace_summary(result.trace)["max_swapin_mib"], 64)
+
+    def test_the_trace_of_an_empty_run_is_empty(self):
+        self.assertEqual(H.trace_summary([]), {"samples": 0, "max_swapin_mib": 0.0,
+                                               "max_swapout_pages": 0,
+                                               "max_pressure_level": None,
+                                               "min_available_mb": None,
+                                               "max_compressor_growth_mb": None,
+                                               "compressor_warnings": 0, "trace": []})
 
 
 class AnalysisTests(unittest.TestCase):
