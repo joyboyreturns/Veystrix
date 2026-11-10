@@ -19,7 +19,8 @@
 * **SSD wear and I/O:** streaming experts reads a lot of data. Long prefills read
   hundreds of gigabytes in total. Reads are not writes and cause far less wear, but
   the persistent cache writes snapshots.
-* **Power:** keep the Mac on AC power with Low Power Mode off for long sessions.
+* **Power:** AC power with Low Power Mode off is recommended for long sessions. The engine starts on battery
+  above 25% and refuses to start below it; a charge that falls below 25% during a run stops it.
   Performance and stability measured on battery are marked preliminary.
 
 ## Model checkpoints

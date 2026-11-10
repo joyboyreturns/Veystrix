@@ -27,7 +27,8 @@ model on its own when you open it.
    checks that required files exist; it does not read the weights.
 2. Open **Settings** and review the port (default `8080`), the memory policy and the
    cache folder and quota.
-3. Plug in AC power. Close memory-heavy apps.
+3. Plug in AC power if you can (the engine also starts on battery, but not below 25%). Close
+   memory-heavy apps.
 4. Press **Start Engine**. The first load takes minutes and uses most of the Mac's
    memory. If a safety guard refuses to start, the Dashboard shows the exact reason
    (for example "not enough available memory"). Free memory and try again; do not

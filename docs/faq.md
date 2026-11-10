@@ -13,12 +13,12 @@ for future releases; a release you already installed keeps the terms you accepte
 license. Veystrix never downloads one without your action.
 
 **Can I fork or rebrand it?** Not under this license. See [LICENSE](../LICENSE). The
-earlier MIT-licensed MACQWEN/FlashNext code that Veystrix grew from remains available
+earlier MIT-licensed FlashNext code that Veystrix grew from remains available
 under the MIT license it was published with; this does not extend to Veystrix-owned
 components.
 
 **Why does Veystrix refuse to start?** Its memory and swap guards found too little
-available memory or too much swap. That protects your Mac. Close apps, plug in, and try
+available memory or too much swap. That protects your Mac. Close apps (Veystrix also purges the macOS file cache on its own when that helps), plug in, and try
 again.
 
 **How fast is it?** See [Verified performance](performance.md). It is much slower than a

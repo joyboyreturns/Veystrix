@@ -40,7 +40,8 @@ source and keep their own licenses.
 * Free disk space for the model checkpoint (about 113 GB for the primary
   checkpoint) plus the persistent cache (default quota 50 GB). The model is **not**
   bundled and is never downloaded without your action.
-* An AC power connection is strongly recommended for long sessions.
+* AC power is recommended for long sessions. The engine also runs on battery, but it will not start
+  when the battery is below 25%, and it stops if the charge falls below that during a run.
 
 ## Downloads
 
@@ -85,6 +86,6 @@ Veystrix engine source code or its development history, which are private.
 
 ## Lineage
 
-Veystrix grew out of MIT-licensed work published earlier as MACQWEN and FlashNext.
+Veystrix grew out of MIT-licensed work published earlier (including the FlashNext runtime).
 That earlier code keeps its MIT license and attribution, which are reproduced in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
