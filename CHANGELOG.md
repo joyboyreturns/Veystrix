@@ -1,8 +1,8 @@
 # Changelog
 
 All notable public changes are listed here, newest first. Entries describe what
-shipped and how it was verified; nothing is listed as released until a signed build
-exists.
+shipped and how it was verified; nothing is listed as released until a build is
+published on the Releases page with its checksums.
 
 ## Unreleased
 

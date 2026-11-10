@@ -9,7 +9,7 @@ Hermes Agent, Qwen Code and the DeepSeek Harness can work with it for hours
 without a cloud subscription. A native macOS app starts, stops and supervises the
 engine.
 
-> **Status: pre-release.** The first signed public build has not been published yet
+> **Status: pre-release.** The first public build has not been published yet
 > (see [Releases](#downloads)). Nothing on this page is a claim that a release has
 > been validated on your hardware. Read [Verified performance](docs/performance.md)
 > before you rely on any number.
@@ -51,8 +51,10 @@ There is no public build yet. When the first release is published it will appear
 * `SHA256SUMS.txt`
 * release notes and the notices required by the license
 
-Only builds from that page, signed with the Veystrix Developer ID and notarized by
-Apple, are official. See [Verifying a download](docs/verifying-downloads.md).
+Only builds from that page are official, and each is identified by its SHA-256 in
+`SHA256SUMS.txt`. **Veystrix is a free app and is not (yet) notarized by Apple:** macOS will
+warn the first time you open it and you approve it once in System Settings. See
+[Installation](docs/installation.md) and [Verifying a download](docs/verifying-downloads.md).
 Anything else, including copies on other sites, repackaged installers and "cracked" or
 "activated" builds, is not Veystrix. Veystrix needs no activation, so any site that
 offers one is not official.

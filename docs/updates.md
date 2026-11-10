@@ -8,7 +8,8 @@ Veystrix uses the [Sparkle 2](https://sparkle-project.org) updater.
   `https://raw.githubusercontent.com/joyboyreturns/Veystrix/main/updates/appcast.xml`
 * Every update archive is signed with an EdDSA (Ed25519) key. The app contains only
   the matching public key and refuses an archive whose signature does not verify. The
-  archive's code signature and Apple notarization are also checked by macOS.
+  archive's code signature is also checked (Apple notarization applies only to releases
+  announced as notarized; free builds are not).
 * The app never installs an update with an older version number than the one you
   already have.
 * An update never touches your model folder, cache or sessions. The engine's cache

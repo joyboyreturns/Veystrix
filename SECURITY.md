@@ -18,6 +18,8 @@ libraries) should also be reported to those projects.
 
 ## Integrity of releases
 
-Official downloads are signed with a Developer ID, notarized by Apple, checksummed in
-`SHA256SUMS.txt`, and updates are EdDSA-signed. See
+Official downloads are checksummed in `SHA256SUMS.txt` and updates are EdDSA-signed. The first
+releases are **not notarized by Apple** (free build, ad-hoc signed), so the checksum is your protection
+against a tampered copy: always verify it, and only download from the Releases page. Developer ID signing
+and notarization may be added later. See
 [Verifying a download](docs/verifying-downloads.md).

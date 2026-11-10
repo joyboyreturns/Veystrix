@@ -4,9 +4,11 @@ Plans are intentions, not promises. Items move only when they are verified.
 
 ## Before the first public release
 
-- [ ] Developer ID signing, Hardened Runtime and Apple notarization of the app and the
-      engine helper (blocked until signing credentials are available).
-- [ ] Sparkle update signing key generated and stored offline; first signed appcast entry.
+- [x] Sparkle update signing key generated (2026-11-10); the private key is held by the owner.
+- [ ] First free build (ad-hoc signed, not notarized) with checksums; first EdDSA-signed appcast entry;
+      test an in-app update between two builds.
+- [ ] *Later, optional:* Apple Developer ID signing, Hardened Runtime and notarization (needs a paid Apple
+      Developer Program membership). The release pipeline is ready; Veystrix does not depend on it.
 - [ ] Legal review of the license and the third-party notices.
 - [ ] Full-routing validation of the shipped engine configuration on AC power under the
       published measurement standard.
